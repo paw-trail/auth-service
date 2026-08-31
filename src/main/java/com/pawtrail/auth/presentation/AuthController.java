@@ -2,7 +2,10 @@ package com.pawtrail.auth.presentation;
 
 import com.pawtrail.auth.application.dto.response.AccountResponse;
 import com.pawtrail.auth.application.service.AuthService;
+import com.pawtrail.auth.application.service.EmailVerificationService;
+import com.pawtrail.auth.application.service.PasswordResetService;
 import com.pawtrail.auth.infrastructure.security.CookieFactory;
+import com.pawtrail.auth.presentation.request.EmailVerificationRequest;
 import com.pawtrail.auth.presentation.request.LoginRequest;
 import com.pawtrail.auth.presentation.request.SignupRequest;
 import com.pawtrail.common.response.CommonApiResponse;
@@ -33,6 +36,8 @@ import org.springframework.web.bind.annotation.RestController;
 public class AuthController {
 
     private final AuthService authService;
+    private final EmailVerificationService emailVerificationService;
+    private final PasswordResetService passwordResetService;
     private final CookieFactory cookieFactory;
 
     /**
@@ -100,5 +105,64 @@ public class AuthController {
                 .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
                 .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
                 .body(CommonApiResponse.success(result.account()));
+    }
+
+    /**
+     * 회원가입 인증 코드를 보냅니다.
+     *
+     * 이미 쓰는 이메일이면 그 사실을 알려 줍니다.
+     * 아래 비밀번호 재설정과 정반대인데, 가입은 알려 주지 않으면
+     * 사용자가 왜 진행이 안 되는지 알 수 없기 때문입니다.
+     */
+    @PostMapping("/email/verify-request")
+    public ResponseEntity<CommonApiResponse<Void>> sendSignupCode(
+            @Valid @RequestBody EmailVerificationRequest.SendCode request) {
+
+        emailVerificationService.sendCode(request.email());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 회원가입 인증 코드를 확인합니다.
+     *
+     * 통과하면 표시가 남고 회원가입이 그것을 확인합니다.
+     * 표시는 30분간 유효하므로 그 안에 가입을 마쳐야 합니다.
+     */
+    @PostMapping("/email/verify")
+    public ResponseEntity<CommonApiResponse<Void>> verifySignupCode(
+            @Valid @RequestBody EmailVerificationRequest.VerifyCode request) {
+
+        emailVerificationService.verify(request.email(), request.code());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 비밀번호 재설정 코드를 보냅니다.
+     *
+     * 어떤 경우에도 성공으로 응답합니다.
+     * 가입되지 않은 이메일이어도, 소셜 계정이어도, 발송이 실패해도 마찬가지입니다.
+     * 응답이 갈리면 그 차이만으로 어떤 이메일이 가입되어 있는지 알아낼 수 있습니다.
+     */
+    @PostMapping("/password/reset-request")
+    public ResponseEntity<CommonApiResponse<Void>> sendResetCode(
+            @Valid @RequestBody EmailVerificationRequest.SendCode request) {
+
+        passwordResetService.sendCode(request.email());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 코드를 확인하고 비밀번호를 바꿉니다.
+     *
+     * 로그인 상태에서 바꾸는 것과 다른 기능입니다.
+     * 그쪽은 현재 비밀번호로 본인을 확인하지만 여기는 그것을 모르는 상태라
+     * 메일이 본인 확인 수단입니다.
+     */
+    @PostMapping("/password/reset")
+    public ResponseEntity<CommonApiResponse<Void>> resetPassword(
+            @Valid @RequestBody EmailVerificationRequest.ResetPassword request) {
+
+        passwordResetService.reset(request.email(), request.code(), request.newPassword());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
     }
 }

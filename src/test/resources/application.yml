@@ -1,13 +1,13 @@
 # 테스트 전용 설정임
 #
-# ★이 파일은 src/main/resources/application.yml 을 덮어쓰는 것이 아니라 통째로 가림
+# * 이 파일은 src/main/resources/application.yml 을 덮어쓰는 것이 아니라 통째로 가림
 #   클래스패스에서 application.yml 을 하나만 찾는데
 #   Gradle 테스트에서는 build/resources/test 가 앞서기 때문임
 #   따라서 main 쪽에 있던 값도 여기 필요하면 다시 적어야 함
 #   main 에 있는 세 줄 중 spring.application.name 과 spring.profiles.default 를 다시 적었고
 #   spring.config.import 는 아래에서 설정 서버를 끄므로 적지 않음
 #
-# ★아래 값 중 넷은 config 저장소 1계층(application.yml)의 사본임
+# * 아래 값 중 넷은 config 저장소 1계층(application.yml)의 사본임
 #   테스트에서는 설정 서버를 끄므로 1계층 값이 하나도 내려오지 않기 때문임
 #   config 저장소에서 그 값을 바꾸면 여기도 함께 봐야 함
 
@@ -44,6 +44,19 @@ spring:
     # 여기가 없으면 기본값 classpath:db/migration 으로 떨어져 운영과 다른 경로로 검증됨
     locations: classpath:db/migration/common,classpath:db/migration/service
 
+  mail:
+    # JavaMailSender 빈이 만들어지게 하는 최소 설정임
+    #
+    # * host 가 없으면 그 빈이 아예 안 만들어짐
+    #   자동 설정이 이 값의 존재로 켜짐 여부를 판단하기 때문임
+    #   그러면 SmtpMailSender 가 주입받을 것이 없어 기동이 실패하고,
+    #   메시지가 NoSuchBeanDefinitionException 이라 원인이 메일 설정이라는 것이 안 드러남
+    #
+    # 실제로 접속하지 않으므로 값 자체는 아무것이나 됨
+    # 테스트가 메일을 보내지 않고, 보내려 해도 여기에 서버가 없음
+    host: localhost
+    port: 25
+
 eureka:
   client:
     # 테스트는 서비스 디스커버리에 참여하지 않음
@@ -53,7 +66,7 @@ eureka:
 # ── 아래는 테스트에서만 쓰는 값임 ─────────────────────────────
 #
 # 설정 서버를 껐으므로 config 저장소의 auth-service.yml 이 내려오지 않음
-# 그런데 JwtProperties 와 AuthProperties 가 값이 비면 기동을 막게 되어 있어
+# 그런데 JwtProperties 와 AuthProperties 와 MailProperties 가 값이 비면 기동을 막게 되어 있어
 # 여기에 없으면 contextLoads 가 그 검증에 걸려 실패함
 #
 # 검증을 끄지 않고 값을 채우는 쪽을 택한 이유는
@@ -82,3 +95,11 @@ app:
       secure: false
       domain: ""
       refresh-path: /api/v1/auth
+
+  mail:
+    # MailProperties 가 값이 비면 기동을 막게 되어 있어 채움
+    #
+    # 위 spring.mail 과 역할이 다름
+    #   spring.mail   접속할 서버와 계정, 스프링이 읽어 감
+    #   app.mail      메일에 표시되는 보내는 사람 주소, 우리가 읽음
+    from: test@example.com

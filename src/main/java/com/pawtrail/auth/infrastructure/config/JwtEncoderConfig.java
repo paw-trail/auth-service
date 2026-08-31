@@ -27,7 +27,7 @@ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
  * 그것을 손으로 하면 틀려도 토큰이 만들어지고 검증 단계에서야 드러납니다.
  */
 @Configuration
-@EnableConfigurationProperties({JwtProperties.class, AuthProperties.class})
+@EnableConfigurationProperties({JwtProperties.class, AuthProperties.class, MailProperties.class})
 public class JwtEncoderConfig {
 
     /**
