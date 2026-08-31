@@ -1,6 +1,7 @@
 package com.pawtrail.auth.application.service;
 
 import com.pawtrail.auth.application.dto.response.AccountResponse;
+import com.pawtrail.auth.application.support.AfterCommitExecutor;
 import com.pawtrail.auth.domain.event.payload.AccountCreatedEvent;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.model.Account;
@@ -21,8 +22,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * 회원가입과 로그인을 처리합니다.
@@ -43,6 +42,7 @@ public class AuthService {
     private final TokenProvider tokenProvider;
     private final OutboxEventRecorder outboxEventRecorder;
     private final EmailVerificationStore emailVerificationStore;
+    private final AfterCommitExecutor afterCommitExecutor;
 
     /**
      * 회원가입입니다.
@@ -91,7 +91,7 @@ public class AuthService {
         // 표시의 뜻이 "이번 가입에 쓸 수 있다" 이므로 쓴 뒤에 지우는 것이 맞습니다.
         //
         // 여기서 바로 지우지 않는 이유는 아래 afterCommit 설명에 있습니다.
-        runAfterCommit(() -> emailVerificationStore.clearVerified(email),
+        afterCommitExecutor.run(() -> emailVerificationStore.clearVerified(email),
                 "이메일 인증 표시 삭제");
 
         log.info("회원가입 완료 accountId={}", account.getId());
@@ -167,7 +167,7 @@ public class AuthService {
         //
         // 저장소 쪽만 커밋 뒤로 미룹니다. 이력은 데이터베이스라 트랜잭션에 함께 묶입니다.
         Duration refreshTtl = Duration.between(Instant.now(), refreshToken.expiresAt());
-        runAfterCommit(
+        afterCommitExecutor.run(
                 () -> refreshTokenStore.save(refreshToken.tokenId(), account.getId(), refreshTtl),
                 "리프레시 토큰 저장");
 
@@ -183,50 +183,6 @@ public class AuthService {
 
         log.info("로그인 성공 accountId={}", account.getId());
         return new LoginResult(AccountResponse.from(account), accessToken, refreshToken);
-    }
-
-    /**
-     * 트랜잭션이 커밋된 뒤에 실행합니다.
-     *
-     * 왜 필요한가
-     *
-     * Redis 는 트랜잭션에 묶이지 않습니다.
-     * 데이터베이스 작업 사이에서 Redis 를 바꾸면, 뒤에서 롤백이 났을 때
-     * 데이터베이스는 되돌아가는데 Redis 는 그대로 남아 둘이 어긋납니다.
-     *   가입   계정은 안 만들어졌는데 이메일 인증 표시만 사라짐 - 다시 인증해야 함
-     *   로그인 이력에 없는 리프레시 토큰이 만료까지 살아 있음
-     *
-     * 공통 모듈의 OutboxCommitListener 도 같은 이유로 커밋 이후에 발행합니다.
-     * 이 서비스만 다른 방식을 쓰면 같은 문제를 두 가지로 푸는 셈이 되므로 맞췄습니다.
-     *
-     * 감수하는 것
-     *
-     * 커밋이 끝난 뒤라 여기서 실패해도 호출자에게 전달되지 않습니다.
-     * 로그만 남고 응답은 성공으로 나갑니다.
-     * 다만 어느 쪽이든 복구할 길이 있어 큰 문제가 되지 않습니다.
-     *   인증 표시가 안 지워짐   이메일이 중복될 수 없어 두 번째 가입이 어차피 막힘
-     *   토큰이 저장 안 됨       다음 갱신 요청이 실패해 다시 로그인하게 됨
-     *
-     * 트랜잭션이 없으면 그냥 바로 실행합니다.
-     * 테스트에서 트랜잭션 없이 부르는 경우가 있어 그때 조용히 건너뛰지 않게 합니다.
-     */
-    private void runAfterCommit(Runnable action, String description) {
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            action.run();
-            return;
-        }
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                try {
-                    action.run();
-                } catch (Exception e) {
-                    // 여기서 던지면 이미 끝난 트랜잭션 밖으로 나가 아무도 받지 않습니다.
-                    // 남길 수 있는 것이 로그뿐이므로 무엇이 실패했는지를 적어 둡니다.
-                    log.error("커밋 이후 작업에 실패했습니다: {}", description, e);
-                }
-            }
-        });
     }
 
     // 토큰은 Instant 로 시각을 다루고 엔티티는 LocalDateTime 을 씁니다.
