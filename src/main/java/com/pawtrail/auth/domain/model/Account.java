@@ -113,8 +113,17 @@ public class Account extends BaseEntity {
      * 이메일과 비밀번호로 가입한 계정을 만듭니다.
      *
      * @param passwordHash 이미 BCrypt 로 해싱된 값입니다. 평문을 넘기지 않습니다.
+     * @throws IllegalArgumentException 비밀번호가 비어 있으면 로컬 계정이 성립하지 않습니다.
      */
     public static Account createLocal(String email, String passwordHash) {
+        requireText(email, "이메일");
+
+        // 팩터리를 두 개로 나눈 이유가 잘못된 조합을 못 만들게 하는 것이므로
+        // 여기서 막지 않으면 이름만 갈라 두고 실제로는 아무 조합이나 만들 수 있음
+        if (passwordHash == null || passwordHash.isBlank()) {
+            throw new IllegalArgumentException(
+                    "로컬 계정은 비밀번호가 반드시 있어야 합니다. email=" + email);
+        }
         return new Account(email, passwordHash, AuthProvider.LOCAL, null);
     }
 
@@ -122,15 +131,38 @@ public class Account extends BaseEntity {
      * 소셜 로그인으로 만들어진 계정을 만듭니다.
      *
      * @param providerUserId 제공자가 주는 고유 식별자입니다. 구글은 id_token 의 sub 입니다.
+     * @throws IllegalArgumentException 제공자가 비밀번호를 쓰는 방식이거나 식별자가 비어 있는 경우입니다.
      */
     public static Account createSocial(String email, AuthProvider authProvider,
                                        String providerUserId) {
-        return new Account(email, authProvider, providerUserId);
+        requireText(email, "이메일");
+
+        // hasPassword 로 판단하면 비밀번호를 쓰는 제공자가 늘어나도 그대로 걸러짐
+        // authProvider != LOCAL 로 적으면 그때 조건을 함께 고쳐야 함
+        if (authProvider == null || authProvider.hasPassword()) {
+            throw new IllegalArgumentException(
+                    "소셜 계정이 아닙니다. authProvider=" + authProvider);
+        }
+        if (providerUserId == null || providerUserId.isBlank()) {
+            throw new IllegalArgumentException(
+                    "소셜 계정은 제공자 식별자가 반드시 있어야 합니다. authProvider=" + authProvider);
+        }
+        return new Account(email, null, authProvider, providerUserId);
     }
 
-    // 위 팩터리가 쓰는 보조 생성자임
-    private Account(String email, AuthProvider authProvider, String providerUserId) {
-        this(email, null, authProvider, providerUserId);
+    // 위 검증들이 던지는 것이 CustomException 이 아니라 IllegalArgumentException 인 이유
+    //
+    // 이 조건들이 깨지는 것은 사용자 입력이 잘못된 것이 아니라
+    // 우리 코드가 팩터리를 잘못 부른 것임
+    // 400 으로 내보내면 사용자가 무엇을 고쳐야 할지 알 수 없으므로
+    // GlobalExceptionHandler 의 마지막 핸들러가 500 으로 잡는 것이 맞음
+    //
+    // "서비스에서 던지는 유일한 예외는 CustomException" 규칙은
+    // 비즈니스 예외를 두고 한 말이며 계약 위반은 성격이 다름
+    private static void requireText(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(name + "은(는) 비어 있을 수 없습니다");
+        }
     }
 
     // 탈퇴 처리임
