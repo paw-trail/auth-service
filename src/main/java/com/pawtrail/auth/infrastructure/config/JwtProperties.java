@@ -44,6 +44,10 @@ public record JwtProperties(String privateKeyB64,
                     "app.jwt.access-expiry 와 refresh-expiry 가 필요합니다. "
                             + "config 저장소의 auth-service.yml 을 확인하십시오");
         }
+        if (issuer == null || issuer.isBlank()) {
+            throw new IllegalStateException(
+                    "app.jwt.issuer 가 비어 있습니다. config 저장소의 auth-service.yml 을 확인하십시오");
+        }
         if (claim == null) {
             throw new IllegalStateException(
                     "app.jwt.claim 이 비어 있습니다. 게이트웨이 설정과 같은 이름을 지정해야 합니다");
@@ -60,5 +64,29 @@ public record JwtProperties(String privateKeyB64,
      * @param role      권한을 넣을 이름입니다. 표준에 없어 우리가 정한 이름입니다.
      */
     public record ClaimNames(String accountId, String role) {
+
+        /**
+         * 두 이름이 비어 있으면 기동을 막습니다.
+         *
+         * 여기서 막지 않으면 기동은 정상이고 로그인할 때가 되어서야 실패합니다.
+         * 그 시점의 예외는 토큰을 만드는 자리에서 나므로 설정 문제라는 것이 드러나지 않습니다.
+         *
+         * 빈 문자열이 특히 위험합니다.
+         * null 은 토큰 생성기가 거부하지만 빈 문자열은 그대로 통과해
+         * 이름 없는 항목이 든 토큰이 만들어지고, 게이트웨이가 값을 못 찾아 401 만 내보냅니다.
+         */
+        public ClaimNames {
+            if (accountId == null || accountId.isBlank()) {
+                throw new IllegalStateException(
+                        "app.jwt.claim.account-id 가 비어 있습니다. "
+                                + "게이트웨이의 app.jwt.claim.account-id 와 같은 값이어야 합니다");
+            }
+            if (role == null || role.isBlank()) {
+                throw new IllegalStateException(
+                        "app.jwt.claim.role 이 비어 있습니다. "
+                                + "게이트웨이의 app.jwt.claim.role 과 같은 값이어야 합니다");
+            }
+        }
     }
+
 }

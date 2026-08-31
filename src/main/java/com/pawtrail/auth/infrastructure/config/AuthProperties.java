@@ -58,5 +58,28 @@ public record AuthProperties(List<String> permitAll, CookieOptions cookie) {
      *                       장소 조회 같은 평범한 요청에는 아예 붙지 않아 노출 면적이 줄어듭니다
      */
     public record CookieOptions(boolean secure, String domain, String refreshPath) {
+
+        /**
+         * 경로가 비어 있으면 기동을 막습니다.
+         *
+         * 이 값이 null 이면 쿠키에 Path 속성이 아예 붙지 않고,
+         * 그러면 브라우저가 요청한 경로를 기준으로 적용 범위를 스스로 정합니다.
+         * 의도한 /api/v1/auth 보다 넓어지거나 좁아집니다.
+         *
+         * 로그아웃이 더 문제입니다.
+         * 쿠키를 지우려면 만들 때와 같은 경로를 지정해야 하는데,
+         * 양쪽 다 경로가 없으면 브라우저가 서로 다른 쿠키로 보아 원래 것이 그대로 남습니다.
+         * 오류가 나지 않으므로 "로그아웃했는데 토큰이 살아 있는" 상태를 알아채기 어렵습니다.
+         *
+         * domain 은 빈 값을 허용합니다.
+         * 비우면 요청한 호스트에만 적용된다는 뜻이고 그것이 우리가 원하는 기본 동작입니다.
+         */
+        public CookieOptions {
+            if (refreshPath == null || refreshPath.isBlank()) {
+                throw new IllegalStateException(
+                        "app.auth.cookie.refresh-path 가 비어 있습니다. "
+                                + "config 저장소의 auth-service.yml 을 확인하십시오");
+            }
+        }
     }
 }
