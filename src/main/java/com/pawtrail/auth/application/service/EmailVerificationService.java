@@ -5,6 +5,7 @@ import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.provider.MailSender;
 import com.pawtrail.auth.domain.repository.AccountRepository;
 import com.pawtrail.auth.domain.repository.EmailVerificationStore;
+import com.pawtrail.auth.domain.repository.SendRateLimitStore;
 import com.pawtrail.common.exception.CustomException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -33,6 +34,7 @@ public class EmailVerificationService {
 
     private final AccountRepository accountRepository;
     private final EmailVerificationStore emailVerificationStore;
+    private final SendRateLimitStore sendRateLimitStore;
     private final VerificationCodeGenerator codeGenerator;
     private final MailSender mailSender;
 
@@ -52,12 +54,30 @@ public class EmailVerificationService {
             throw new CustomException(AuthErrorCode.EMAIL_ALREADY_EXISTS);
         }
 
+        // 너무 자주 요청하면 막습니다.
+        //
+        // 이 경로는 인증이 필요 없어 누구나 계속 부를 수 있습니다.
+        // 여기서 막지 않으면 남의 주소로 메일이 쏟아지고,
+        // 하루 발송 한도가 소진되어 정상 사용자도 메일을 못 받게 됩니다.
+        //
+        // 가입 인증은 이미 위에서 계정 존재 여부를 알려 주고 있으므로
+        // 제한 사실을 숨길 이유가 없습니다. 그대로 알려 줍니다.
+        if (!sendRateLimitStore.canSend(email)) {
+            throw new CustomException(AuthErrorCode.MAIL_SEND_COOLDOWN);
+        }
+
         String code = codeGenerator.generate();
         emailVerificationStore.saveCode(email, code);
 
         // 발송이 실패하면 예외가 그대로 올라가 500 이 나갑니다.
         // 사용자가 오지 않는 코드를 기다리는 것보다 실패를 아는 편이 낫습니다.
         mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.SIGNUP);
+
+        // 보낸 뒤에 기록합니다.
+        //
+        // 발송을 시도조차 못 한 경우까지 세면
+        // 메일 서버가 잠시 죽었을 때 정상 사용자가 한도를 다 쓰고 막힙니다.
+        sendRateLimitStore.recordSent(email);
     }
 
     /**

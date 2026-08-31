@@ -1,5 +1,6 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.presentation.request.validation.MaxBytes;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -28,11 +29,14 @@ public record SignupRequest(
         //   대문자와 특수문자를 요구하면 Password1! 같은 형태로 수렴합니다
         //   미국 표준 기관도 조합 요구를 권장하지 않는 쪽으로 바뀌었습니다
         //
-        // * 상한 64자는 BCrypt 의 제약입니다
-        //   72바이트를 넘는 부분은 조용히 잘려 나가므로,
-        //   한글이 한 글자에 3바이트인 것을 감안해 64자로 둡니다
+        // * 상한을 글자 수와 바이트 수로 두 번 겁니다
+        //   BCrypt 가 72바이트를 넘는 입력을 거부하는데 Size 는 글자 수만 세므로,
+        //   한글 25자처럼 글자 수는 적고 바이트는 큰 값이 그대로 통과합니다
+        //   그러면 형식 검증을 지난 요청이 해싱하는 자리에서 터져 500 이 나갑니다
+        //   글자 수를 24로 줄이면 이 문제는 사라지지만 영문을 쓰는 사람이 손해를 봅니다
         @NotBlank(message = "비밀번호를 입력해 주세요")
-        @Size(min = 8, max = 64, message = "비밀번호는 8자 이상 64자 이하여야 합니다")
+        @Size(min = 8, max = 72, message = "비밀번호는 8자 이상 72자 이하여야 합니다")
+        @MaxBytes(value = 72, message = "비밀번호가 너무 깁니다. 한글은 한 글자가 세 자리로 계산됩니다")
         String password,
 
         // 중복을 허용합니다.

@@ -1,5 +1,6 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.presentation.request.validation.MaxBytes;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
@@ -63,10 +64,10 @@ public final class EmailVerificationRequest {
             @Pattern(regexp = "\\d{6}", message = "인증 코드는 6자리 숫자입니다")
             String code,
 
-            // 가입 때와 같은 규칙입니다.
-            // 상한 64자는 BCrypt 가 72바이트를 넘는 부분을 잘라내기 때문입니다.
+            // 가입 때와 같은 규칙입니다. 근거는 SignupRequest 에 적어 두었습니다.
             @NotBlank(message = "새 비밀번호를 입력해 주세요")
-            @Size(min = 8, max = 64, message = "비밀번호는 8자 이상 64자 이하여야 합니다")
+            @Size(min = 8, max = 72, message = "비밀번호는 8자 이상 72자 이하여야 합니다")
+            @MaxBytes(value = 72, message = "비밀번호가 너무 깁니다. 한글은 한 글자가 세 자리로 계산됩니다")
             String newPassword
     ) {
     }

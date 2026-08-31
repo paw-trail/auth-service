@@ -7,6 +7,7 @@ import com.pawtrail.auth.domain.model.Account;
 import com.pawtrail.auth.domain.provider.MailSender;
 import com.pawtrail.auth.domain.repository.AccountRepository;
 import com.pawtrail.auth.domain.repository.PasswordResetStore;
+import com.pawtrail.auth.domain.repository.SendRateLimitStore;
 import com.pawtrail.common.exception.CustomException;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
@@ -35,6 +36,7 @@ public class PasswordResetService {
 
     private final AccountRepository accountRepository;
     private final PasswordResetStore passwordResetStore;
+    private final SendRateLimitStore sendRateLimitStore;
     private final VerificationCodeGenerator codeGenerator;
     private final PasswordEncoder passwordEncoder;
     private final MailSender mailSender;
@@ -62,6 +64,18 @@ public class PasswordResetService {
             return;
         }
 
+        // 너무 자주 요청하면 보내지 않습니다.
+        //
+        // * 가입 인증과 달리 여기서는 예외를 던지지 않습니다.
+        //   제한에 걸렸을 때만 다른 응답이 나가면,
+        //   그것만으로 "이 이메일은 앞서 요청된 적이 있다" 가 드러납니다.
+        //   위에서 계정이 없는 경우를 조용히 접은 것과 같은 이유이며,
+        //   응답이 갈리는 자리를 하나도 만들지 않는 것이 이 기능의 규칙입니다.
+        if (!sendRateLimitStore.canSend(email)) {
+            log.info("발송 제한에 걸린 요청입니다. 응답은 성공으로 보냅니다.");
+            return;
+        }
+
         String code = codeGenerator.generate();
         passwordResetStore.saveCode(email, code);
 
@@ -72,6 +86,12 @@ public class PasswordResetService {
         // 없는 이메일은 위에서 이미 돌아가 발송 자체를 시도하지 않기 때문입니다.
         try {
             mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.PASSWORD_RESET);
+
+            // 보낸 뒤에 기록합니다.
+            // 발송이 실패한 경우까지 세면 메일 서버가 잠시 죽었을 때
+            // 정상 사용자가 한도를 다 쓰고 막힙니다.
+            sendRateLimitStore.recordSent(email);
+
         } catch (Exception e) {
             log.error("재설정 메일 발송에 실패했습니다. 응답은 성공으로 보냅니다.", e);
         }
