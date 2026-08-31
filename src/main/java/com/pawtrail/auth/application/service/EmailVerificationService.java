@@ -54,29 +54,40 @@ public class EmailVerificationService {
             throw new CustomException(AuthErrorCode.EMAIL_ALREADY_EXISTS);
         }
 
-        // 너무 자주 요청하면 막습니다.
+        // 보낼 자리를 잡습니다. 잡지 못하면 보내지 않습니다.
         //
         // 이 경로는 인증이 필요 없어 누구나 계속 부를 수 있습니다.
         // 여기서 막지 않으면 남의 주소로 메일이 쏟아지고,
         // 하루 발송 한도가 소진되어 정상 사용자도 메일을 못 받게 됩니다.
         //
+        // 묻지 않고 잡는 이유는, 물어보기만 하면 그 뒤 발송에 걸리는 몇 초 동안
+        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문입니다.
+        //
         // 가입 인증은 이미 위에서 계정 존재 여부를 알려 주고 있으므로
         // 제한 사실을 숨길 이유가 없습니다. 그대로 알려 줍니다.
-        if (!sendRateLimitStore.canSend(email)) {
+        if (!sendRateLimitStore.tryAcquire(email)) {
             throw new CustomException(AuthErrorCode.MAIL_SEND_COOLDOWN);
         }
 
         String code = codeGenerator.generate();
         emailVerificationStore.saveCode(email, code);
 
-        // 발송이 실패하면 예외가 그대로 올라가 500 이 나갑니다.
-        // 사용자가 오지 않는 코드를 기다리는 것보다 실패를 아는 편이 낫습니다.
-        mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.SIGNUP);
+        try {
+            // 발송이 실패하면 예외가 그대로 올라가 500 이 나갑니다.
+            // 사용자가 오지 않는 코드를 기다리는 것보다 실패를 아는 편이 낫습니다.
+            mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.SIGNUP);
+
+        } catch (RuntimeException e) {
+            // 보내지 못했으므로 잡아 둔 자리를 돌려줍니다.
+            // 그러지 않으면 메일이 오지도 않았는데 다음 시도가 쿨다운에 막힙니다.
+            sendRateLimitStore.release(email);
+            throw e;
+        }
 
         // 보낸 뒤에 기록합니다.
         //
         // 발송을 시도조차 못 한 경우까지 세면
-        // 메일 서버가 잠시 죽었을 때 정상 사용자가 한도를 다 쓰고 막힙니다.
+        // 메일 서버가 잠깐 죽었을 때 정상 사용자가 한도를 다 쓰고 막힙니다.
         sendRateLimitStore.recordSent(email);
     }
 
@@ -86,7 +97,7 @@ public class EmailVerificationService {
     public void verify(String email, String inputCode) {
 
         String saved = emailVerificationStore.findCode(email)
-                .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
+            .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
 
         if (!saved.equals(inputCode)) {
             int attempt = emailVerificationStore.increaseAttempt(email);

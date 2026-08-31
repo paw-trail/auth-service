@@ -12,6 +12,16 @@ import org.springframework.stereotype.Repository;
  * 값이 저절로 사라져야 하는 성격이라 Redis 가 맞습니다.
  * 데이터베이스에 두면 지난 기록을 지우는 작업을 따로 만들어야 하고,
  * 남길 가치도 없는 이력이 쌓입니다.
+ *
+ * 동시 요청을 어떻게 막는가
+ *
+ * 쿨다운 키를 setIfAbsent 로 잡습니다.
+ * 이 명령은 "없을 때만 넣는다" 를 Redis 안에서 한 번에 처리하므로,
+ * 같은 순간에 요청이 백 개 들어와도 참을 받는 것은 하나뿐입니다.
+ *
+ * 시간당 카운터는 따로 원자화하지 않습니다.
+ * 쿨다운이 앞에서 한 번에 하나만 통과시키므로, 카운터를 읽는 시점에는
+ * 앞선 발송이 이미 반영되어 있어 둘이 겹칠 창 자체가 없습니다.
  */
 @Repository
 @RequiredArgsConstructor
@@ -36,25 +46,39 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
     private final StringRedisTemplate redisTemplate;
 
     @Override
-    public boolean canSend(String email) {
+    public boolean tryAcquire(String email) {
 
-        // 쿨다운 키가 살아 있으면 아직 때가 아닙니다.
-        if (Boolean.TRUE.equals(redisTemplate.hasKey(cooldownKey(email)))) {
+        // 쿨다운 자리를 먼저 잡습니다.
+        //
+        // 값은 쓰지 않으므로 아무것이나 넣습니다.
+        // 중요한 것은 값이 아니라 "이 키를 내가 만들었는가" 이며,
+        // 그 판단이 Redis 안에서 한 번에 끝나는 것이 이 방식의 전부입니다.
+        Boolean acquired = redisTemplate.opsForValue()
+            .setIfAbsent(cooldownKey(email), "1", COOLDOWN);
+
+        if (!Boolean.TRUE.equals(acquired)) {
             return false;
         }
 
+        // 여기부터는 이 요청 하나만 지나갑니다.
+        // 그래서 아래 카운터 읽기는 다른 요청과 겹치지 않습니다.
         String count = redisTemplate.opsForValue().get(hourlyKey(email));
-        if (count == null) {
-            return true;
+
+        if (count != null && Integer.parseInt(count) >= HOURLY_LIMIT) {
+
+            // 상한에 걸렸으면 잡아 둔 자리를 돌려줍니다.
+            //
+            // 보내지 않았는데 쿨다운을 물리면 그 값이 거짓말이 됩니다.
+            // 돌려주어도 이 주소는 카운터에 막혀 있어 계속 거부되므로 안전합니다.
+            release(email);
+            return false;
         }
-        return Integer.parseInt(count) < HOURLY_LIMIT;
+
+        return true;
     }
 
     @Override
     public void recordSent(String email) {
-
-        // 쿨다운을 시작합니다. 값은 쓰지 않으므로 아무것이나 넣습니다.
-        redisTemplate.opsForValue().set(cooldownKey(email), "1", COOLDOWN);
 
         Long count = redisTemplate.opsForValue().increment(hourlyKey(email));
 
@@ -67,6 +91,14 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
         if (count != null && count == 1L) {
             redisTemplate.expire(hourlyKey(email), HOURLY_WINDOW);
         }
+    }
+
+    @Override
+    public void release(String email) {
+
+        // 쿨다운만 지웁니다.
+        // 시간당 카운터는 발송에 성공한 뒤에야 올라가므로 되돌릴 것이 없습니다.
+        redisTemplate.delete(cooldownKey(email));
     }
 
     private String cooldownKey(String email) {

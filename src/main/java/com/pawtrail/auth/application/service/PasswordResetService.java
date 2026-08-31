@@ -58,20 +58,23 @@ public class PasswordResetService {
         //   탈퇴한 계정
         //   소셜 계정이라 비밀번호가 없음
         if (found.isEmpty()
-                || !found.get().canLogin()
-                || !found.get().getAuthProvider().hasPassword()) {
+            || !found.get().canLogin()
+            || !found.get().getAuthProvider().hasPassword()) {
             log.info("재설정 대상이 아닌 요청입니다. 응답은 성공으로 보냅니다.");
             return;
         }
 
-        // 너무 자주 요청하면 보내지 않습니다.
+        // 보낼 자리를 잡습니다. 잡지 못하면 보내지 않습니다.
         //
-        // * 가입 인증과 달리 여기서는 예외를 던지지 않습니다.
+        // 묻지 않고 잡는 이유는, 물어보기만 하면 그 뒤 발송에 걸리는 몇 초 동안
+        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문입니다.
+        //
+        // *가입 인증과 달리 여기서는 예외를 던지지 않습니다.
         //   제한에 걸렸을 때만 다른 응답이 나가면,
         //   그것만으로 "이 이메일은 앞서 요청된 적이 있다" 가 드러납니다.
         //   위에서 계정이 없는 경우를 조용히 접은 것과 같은 이유이며,
         //   응답이 갈리는 자리를 하나도 만들지 않는 것이 이 기능의 규칙입니다.
-        if (!sendRateLimitStore.canSend(email)) {
+        if (!sendRateLimitStore.tryAcquire(email)) {
             log.info("발송 제한에 걸린 요청입니다. 응답은 성공으로 보냅니다.");
             return;
         }
@@ -93,6 +96,9 @@ public class PasswordResetService {
             sendRateLimitStore.recordSent(email);
 
         } catch (Exception e) {
+            // 보내지 못했으므로 잡아 둔 자리를 돌려줍니다.
+            // 그러지 않으면 메일이 오지도 않았는데 다음 요청이 쿨다운에 막힙니다.
+            sendRateLimitStore.release(email);
             log.error("재설정 메일 발송에 실패했습니다. 응답은 성공으로 보냅니다.", e);
         }
     }
@@ -108,7 +114,7 @@ public class PasswordResetService {
     public void reset(String email, String inputCode, String newRawPassword) {
 
         String saved = passwordResetStore.findCode(email)
-                .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
+            .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
 
         if (!saved.equals(inputCode)) {
             int attempt = passwordResetStore.increaseAttempt(email);
@@ -125,7 +131,7 @@ public class PasswordResetService {
         // 여기서 계정을 못 찾는 것은 코드를 보낸 뒤에 탈퇴한 경우뿐이라 드뭅니다.
         // 그때는 숨길 이유가 없으므로 그대로 알려 줍니다.
         Account account = accountRepository.findByEmail(email)
-                .orElseThrow(() -> new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND));
+            .orElseThrow(() -> new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND));
 
         account.changePassword(passwordEncoder.encode(newRawPassword));
 
