@@ -47,9 +47,14 @@ CREATE TABLE account
     -- 로그인할 때마다 같은 값이 오므로 이것으로 계정을 찾습니다.
     -- LOCAL 계정은 NULL 입니다.
     --
+    -- 길이를 255 로 두는 것은 OpenID Connect 규격이 sub 의 상한을 그렇게 정하기 때문입니다.
+    -- 구글이 실제로 주는 값은 21 자리 숫자라 훨씬 짧지만,
+    -- 규격이 보장하는 상한에 맞춰야 다른 제공자를 붙일 때도 안전합니다.
+    -- 애플은 000123.abc...def.1234 형태라 실제로 깁니다.
+    --
     -- OAuth 의 code 와 제공자 access_token 은 저장하지 않습니다.
     -- 신원을 확인하는 순간까지만 쓰이고 그 뒤로는 우리 JWT 를 발급해 씁니다.
-    provider_user_id varchar(64),
+    provider_user_id varchar(255),
 
     -- USER · ADMIN
     -- 관리자 가입 API 는 없으며 DB 에서 직접 지정합니다.
