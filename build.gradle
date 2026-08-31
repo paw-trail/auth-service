@@ -51,6 +51,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-security'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.security:spring-security-oauth2-jose'
 
     // ── 데이터 ────────────────────────────────────────────────
     // DB 를 쓰지 않는 서비스(verdict, congestion, route)는
