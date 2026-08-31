@@ -21,6 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * 회원가입과 로그인을 처리합니다.
@@ -82,12 +84,15 @@ public class AuthService {
         outboxEventRecorder.record(
                 new AccountCreatedEvent(account.getId(), account.getEmail(), nickname));
 
-        // 인증 표시를 지웁니다.
+        // 인증 표시를 지웁니다. 커밋이 끝난 뒤에 실행됩니다.
         //
         // 남겨 두면 같은 표시로 여러 번 가입을 시도할 수 있습니다.
         // 지금은 이메일이 중복될 수 없어 두 번째가 막히지만,
         // 표시의 뜻이 "이번 가입에 쓸 수 있다" 이므로 쓴 뒤에 지우는 것이 맞습니다.
-        emailVerificationStore.clearVerified(email);
+        //
+        // 여기서 바로 지우지 않는 이유는 아래 afterCommit 설명에 있습니다.
+        runAfterCommit(() -> emailVerificationStore.clearVerified(email),
+                "이메일 인증 표시 삭제");
 
         log.info("회원가입 완료 accountId={}", account.getId());
         return AccountResponse.from(account);
@@ -121,12 +126,20 @@ public class AuthService {
         Account account = accountRepository.findByEmail(email)
                 .orElseThrow(() -> new CustomException(AuthErrorCode.LOGIN_FAILED));
 
-        // 소셜 계정은 비밀번호가 없습니다.
+        // 소셜 계정도 같은 실패로 처리합니다.
         //
-        // 여기서 걸러 두지 않으면 아래 matches 에 null 이 들어갑니다.
+        // 비밀번호가 없다는 것을 따로 알려 주면 위에서 숨긴 것이 그대로 드러납니다.
+        // 아무 비밀번호나 넣고 응답 코드만 비교해도
+        // "그 이메일은 가입되어 있고 소셜 계정이다" 를 알 수 있기 때문입니다.
+        // 계정을 하나 찾아냈다는 점에서 비밀번호가 틀린 경우와 다를 것이 없습니다.
+        //
         // 판단을 hasPassword 로 하는 것은 비밀번호를 쓰는 제공자가 늘어나도 그대로 맞기 때문입니다.
+        //
+        // 소셜로 가입한 사람이 이유를 모르는 것은 화면이 풀어야 할 몫입니다.
+        // 로그인 화면에 소셜 로그인 버튼이 함께 있으므로 그쪽으로 넘어가면 됩니다.
         if (!account.getAuthProvider().hasPassword()) {
-            throw new CustomException(AuthErrorCode.PASSWORD_NOT_SUPPORTED);
+            log.debug("소셜 계정에 비밀번호 로그인을 시도했습니다. accountId={}", account.getId());
+            throw new CustomException(AuthErrorCode.LOGIN_FAILED);
         }
 
         if (!passwordEncoder.matches(rawPassword, account.getPasswordHash())) {
@@ -151,10 +164,12 @@ public class AuthService {
         //
         //   저장소   아직 쓸 수 있는 토큰인가를 판단합니다. 로그아웃하면 지웁니다
         //   이력     언제 어디서 발급됐는가를 남깁니다. 지우지 않습니다
-        refreshTokenStore.save(
-                refreshToken.tokenId(),
-                account.getId(),
-                Duration.between(Instant.now(), refreshToken.expiresAt()));
+        //
+        // 저장소 쪽만 커밋 뒤로 미룹니다. 이력은 데이터베이스라 트랜잭션에 함께 묶입니다.
+        Duration refreshTtl = Duration.between(Instant.now(), refreshToken.expiresAt());
+        runAfterCommit(
+                () -> refreshTokenStore.save(refreshToken.tokenId(), account.getId(), refreshTtl),
+                "리프레시 토큰 저장");
 
         refreshTokenLogRepository.save(RefreshTokenLog.issue(
                 account.getId(),
@@ -168,6 +183,50 @@ public class AuthService {
 
         log.info("로그인 성공 accountId={}", account.getId());
         return new LoginResult(AccountResponse.from(account), accessToken, refreshToken);
+    }
+
+    /**
+     * 트랜잭션이 커밋된 뒤에 실행합니다.
+     *
+     * 왜 필요한가
+     *
+     * Redis 는 트랜잭션에 묶이지 않습니다.
+     * 데이터베이스 작업 사이에서 Redis 를 바꾸면, 뒤에서 롤백이 났을 때
+     * 데이터베이스는 되돌아가는데 Redis 는 그대로 남아 둘이 어긋납니다.
+     *   가입   계정은 안 만들어졌는데 이메일 인증 표시만 사라짐 - 다시 인증해야 함
+     *   로그인 이력에 없는 리프레시 토큰이 만료까지 살아 있음
+     *
+     * 공통 모듈의 OutboxCommitListener 도 같은 이유로 커밋 이후에 발행합니다.
+     * 이 서비스만 다른 방식을 쓰면 같은 문제를 두 가지로 푸는 셈이 되므로 맞췄습니다.
+     *
+     * 감수하는 것
+     *
+     * 커밋이 끝난 뒤라 여기서 실패해도 호출자에게 전달되지 않습니다.
+     * 로그만 남고 응답은 성공으로 나갑니다.
+     * 다만 어느 쪽이든 복구할 길이 있어 큰 문제가 되지 않습니다.
+     *   인증 표시가 안 지워짐   이메일이 중복될 수 없어 두 번째 가입이 어차피 막힘
+     *   토큰이 저장 안 됨       다음 갱신 요청이 실패해 다시 로그인하게 됨
+     *
+     * 트랜잭션이 없으면 그냥 바로 실행합니다.
+     * 테스트에서 트랜잭션 없이 부르는 경우가 있어 그때 조용히 건너뛰지 않게 합니다.
+     */
+    private void runAfterCommit(Runnable action, String description) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            action.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    action.run();
+                } catch (Exception e) {
+                    // 여기서 던지면 이미 끝난 트랜잭션 밖으로 나가 아무도 받지 않습니다.
+                    // 남길 수 있는 것이 로그뿐이므로 무엇이 실패했는지를 적어 둡니다.
+                    log.error("커밋 이후 작업에 실패했습니다: {}", description, e);
+                }
+            }
+        });
     }
 
     // 토큰은 Instant 로 시각을 다루고 엔티티는 LocalDateTime 을 씁니다.
