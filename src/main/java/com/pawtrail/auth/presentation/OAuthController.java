@@ -13,6 +13,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -84,8 +85,18 @@ public class OAuthController {
      */
     @GetMapping("/{provider}/authorize")
     public ResponseEntity<Void> authorize(@PathVariable String provider) {
-        String authorizationUri = oAuthLoginService.buildAuthorizationUri(provider);
-        return redirectTo(authorizationUri);
+        OAuthLoginService.AuthorizationRequest request =
+                oAuthLoginService.buildAuthorizationUri(provider);
+
+        // 이 흐름을 시작했다는 표시를 브라우저에 남김
+        //
+        // 저장소에만 두면 "우리가 발급한 값인가" 까지만 확인됨
+        // 콜백에서 이 쿠키와 되돌아온 값을 대조해야 "이 브라우저가 시작한 값인가" 가 갈림
+        return ResponseEntity
+                .status(HttpStatus.FOUND)
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.oauthState(request.state()).toString())
+                .location(URI.create(request.authorizationUri()))
+                .build();
     }
 
     /**
@@ -108,6 +119,7 @@ public class OAuthController {
             @RequestParam(required = false) String code,
             @RequestParam(required = false) String state,
             @RequestParam(required = false) String error,
+            @CookieValue(name = CookieFactory.OAUTH_STATE, required = false) String cookieState,
             HttpServletRequest servletRequest) {
 
         // 제공자가 오류를 실어 보낸 경우임
@@ -133,6 +145,7 @@ public class OAuthController {
                     provider,
                     code,
                     state,
+                    cookieState,
                     // 지금은 넣지 않음
                     // 앞에 게이트웨이가 있어 getRemoteAddr 이 게이트웨이 주소를 돌려주며,
                     // 원래 주소를 어떻게 얻을지는 nginx 를 붙일 때 함께 정함
@@ -140,6 +153,22 @@ public class OAuthController {
                     servletRequest.getHeader(HttpHeaders.USER_AGENT));
         } catch (CustomException e) {
             return handleFailure(e);
+        } catch (Exception e) {
+            // 우리가 예상한 실패가 아닌 것도 여기서 이동으로 바꿈
+            //
+            // 이 클래스는 JSON 을 내지 않기로 한 자리라 그대로 흘려보내면
+            // 전역 처리기가 만든 JSON 이 브라우저에 그대로 보임
+            //
+            // 실제로 닿는 길이 있음
+            // Account.linkGoogle 은 이미 다른 식별자와 연결된 계정에서 예외를 던지는데,
+            // 제공자가 같은 이메일에 다른 식별자를 주면 식별자 조회가 빗나가고
+            // 이메일 조회가 기존 계정을 찾아 그 자리에 닿음
+            // 콜백이 동시에 둘 들어와 유일성 제약이 부딪힐 때도 같음
+            //
+            // 나올 수 없는 상황인지와 났을 때 어떻게 보이는지는 다른 문제임
+            // 원인은 스택트레이스까지 남겨 우리가 보고, 사용자에게는 화면을 보여줌
+            log.error("소셜 로그인 처리 중 예상하지 못한 오류가 났습니다", e);
+            return redirectToFrontend(ERROR_PATH, "reason", REASON_FAILED);
         }
 
         ResponseCookie accessCookie = cookieFactory.accessToken(
@@ -149,14 +178,18 @@ public class OAuthController {
 
         String location = frontendUri(SUCCESS_PATH, "isNew", String.valueOf(result.isNew()));
 
-        // 쿠키 두 개를 각각 헤더로 붙임
+        // 쿠키를 각각 헤더로 붙임
         //
-        // Set-Cookie 는 하나의 헤더에 여러 값을 담을 수 없어 줄이 두 개가 됨
-        // header 를 두 번 부르는 것이 그 때문이며 이동 응답에도 쿠키는 그대로 실림
+        // Set-Cookie 는 하나의 헤더에 여러 값을 담을 수 없어 줄이 여러 개가 됨
+        // header 를 세 번 부르는 것이 그 때문이며 이동 응답에도 쿠키는 그대로 실림
+        //
+        // 상태 쿠키는 여기서 지움
+        // 이 흐름이 끝났으므로 남겨 두면 다음 로그인 때 옛 값이 실려 와 어긋남
         return ResponseEntity
                 .status(HttpStatus.FOUND)
                 .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
                 .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireOAuthState().toString())
                 .location(URI.create(location))
                 .build();
     }
@@ -190,8 +223,15 @@ public class OAuthController {
     }
 
     // 프론트 주소를 만들어 이동 응답으로 감쌈
+    //
+    // 상태 쿠키를 함께 지움
+    // 콜백에서 나가는 길이 성공 하나와 이 메서드뿐이라 두 곳만 챙기면 빠뜨릴 자리가 없음
     private ResponseEntity<Void> redirectToFrontend(String path, String name, String value) {
-        return redirectTo(frontendUri(path, name, value));
+        return ResponseEntity
+                .status(HttpStatus.FOUND)
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireOAuthState().toString())
+                .location(URI.create(frontendUri(path, name, value)))
+                .build();
     }
 
     // 프론트 주소를 만듦
@@ -207,14 +247,4 @@ public class OAuthController {
         return builder.build().encode().toUriString();
     }
 
-    // 이동 응답을 만듦
-    //
-    // 302 를 쓰는 것은 이 이동이 한 번뿐인 흐름이기 때문임
-    // 301 로 두면 브라우저가 기억해 두었다가 다음에도 같은 곳으로 가려 함
-    private ResponseEntity<Void> redirectTo(String location) {
-        return ResponseEntity
-                .status(HttpStatus.FOUND)
-                .location(URI.create(location))
-                .build();
-    }
 }

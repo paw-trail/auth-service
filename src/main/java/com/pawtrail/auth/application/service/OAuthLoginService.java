@@ -58,13 +58,26 @@ public class OAuthLoginService {
     private final TokenIssueService tokenIssueService;
 
     /**
+     * 인가를 시작하는 데 필요한 값입니다.
+     *
+     * @param authorizationUri 사용자를 보낼 제공자 주소입니다.
+     * @param state            이 흐름을 시작한 브라우저에 남길 값입니다.
+     *                         부르는 쪽이 쿠키로 심고, 콜백에서 되돌아온 값과 대조합니다.
+     */
+    public record AuthorizationRequest(String authorizationUri, String state) {
+    }
+
+    /**
      * 사용자를 보낼 제공자 인가 주소를 만듭니다.
      *
      * 트랜잭션이 없습니다. 데이터베이스에 쓰는 것이 없고 저장소에만 남기기 때문입니다.
      *
+     * state 를 함께 돌려주는 것은 부르는 쪽이 그것을 쿠키로 심어야 하기 때문입니다.
+     * 쿠키를 여기서 만들지 않는 것은 그것이 HTTP 의 사정이라서입니다.
+     *
      * @throws CustomException 지원하지 않는 제공자인 경우입니다.
      */
-    public String buildAuthorizationUri(String provider) {
+    public AuthorizationRequest buildAuthorizationUri(String provider) {
         requireSupported(provider);
 
         String state = randomValue();
@@ -76,7 +89,7 @@ public class OAuthLoginService {
         // 키가 둘이 되어 만료가 어긋날 여지도 생김
         oAuthStateStore.save(state, nonce);
 
-        return oAuthClient.buildAuthorizationUri(state, nonce);
+        return new AuthorizationRequest(oAuthClient.buildAuthorizationUri(state, nonce), state);
     }
 
     /**
@@ -98,18 +111,32 @@ public class OAuthLoginService {
      * 계정을 만드는 것과 이벤트를 기록하는 것이 한 트랜잭션 안에 있어야 합니다.
      * 나뉘면 "계정은 생겼는데 프로필이 안 생기는" 상태가 만들어집니다.
      *
-     * @param state 제공자가 그대로 돌려준 값입니다. 우리가 시작한 흐름인지 확인합니다.
+     * @param state       제공자가 그대로 돌려준 값입니다.
+     * @param cookieState 인가를 시작할 때 브라우저에 남긴 값입니다. 없으면 null 입니다.
      * @throws CustomException 확인에 실패했거나 탈퇴한 계정인 경우입니다.
      */
     @Transactional
     public OAuthLoginResult callback(String provider, String code, String state,
-                                     String ipAddress, String userAgent) {
+                                     String cookieState, String ipAddress, String userAgent) {
         requireSupported(provider);
+
+        // 이 흐름을 시작한 브라우저가 맞는지 먼저 봄
+        //
+        // 저장소만 보면 "우리가 발급한 값인가" 까지만 확인됨
+        // 공격자가 자기 계정으로 인가를 시작해 얻은 콜백 주소를 남에게 열게 하면
+        // 그 사람의 브라우저에 공격자 계정의 쿠키가 심기는데, 저장소에는 그 값이 멀쩡히 있음
+        //
+        // 저장소를 꺼내기 전에 보는 것이 중요함
+        // 순서가 반대면 남이 시작해 둔 흐름을 대신 소진시켜 버림
+        if (cookieState == null || !cookieState.equals(state)) {
+            log.warn("소셜 로그인 상태 쿠키가 없거나 값이 다릅니다");
+            throw new CustomException(AuthErrorCode.INVALID_OAUTH_STATE);
+        }
 
         // state 를 꺼내면서 지움
         //
-        // 없다는 것은 우리가 시작한 흐름이 아니거나 이미 쓴 값이거나 만료된 것임
-        // 셋을 구분하지 않는 이유는 어느 쪽이든 처음부터 다시 하는 수밖에 없기 때문임
+        // 없다는 것은 이미 쓴 값이거나 만료된 것임
+        // 둘을 구분하지 않는 이유는 어느 쪽이든 처음부터 다시 하는 수밖에 없기 때문임
         //
         // 같은 콜백 주소를 두 번 열면 두 번째가 여기서 걸림
         String nonce = oAuthStateStore.consume(state)
