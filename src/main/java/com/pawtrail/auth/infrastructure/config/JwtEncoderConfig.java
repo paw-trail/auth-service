@@ -42,7 +42,7 @@ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
  */
 @Configuration
 @EnableConfigurationProperties({JwtProperties.class, AuthProperties.class,
-        MailProperties.class, OAuthProperties.class})
+    MailProperties.class, OAuthProperties.class})
 public class JwtEncoderConfig {
 
     /**
@@ -56,11 +56,16 @@ public class JwtEncoderConfig {
     public JwtEncoder jwtEncoder(JwtProperties properties) {
         RSAPrivateKey privateKey = toPrivateKey(properties.privateKeyB64());
 
-        // 공개키를 함께 넣지 않음
-        // 서명에는 개인키만 있으면 되고, 검증은 게이트웨이가 자기 공개키로 함
+        // 공개키를 설정으로 받지 않고 개인키에서 뽑음
+        //
+        // RSAKey.Builder 가 공개키를 첫 인자로 요구하므로 넣지 않을 수는 없음
+        // 다만 따로 받아 두면 두 값이 짝이 맞는지를 사람이 챙겨야 하므로
+        // 개인키에서 파생시켜 그 자리를 없앰
+        //
+        // 게이트웨이는 자기 설정에 든 공개키로 검증하며 이 값과 무관함
         RSAKey jwk = new RSAKey.Builder(toPublicKeyFrom(privateKey))
-                .privateKey(privateKey)
-                .build();
+            .privateKey(privateKey)
+            .build();
 
         JWKSource<SecurityContext> jwkSource = new ImmutableJWKSet<>(new JWKSet(jwk));
         return new NimbusJwtEncoder(jwkSource);
@@ -103,15 +108,15 @@ public class JwtEncoderConfig {
         try {
             String pem = new String(Base64.getDecoder().decode(base64Pem), StandardCharsets.UTF_8);
             String body = pem
-                    .replaceAll("-----[A-Z ]+-----", "")
-                    .replaceAll("\\s", "");
+                .replaceAll("-----[A-Z ]+-----", "")
+                .replaceAll("\\s", "");
             byte[] der = Base64.getDecoder().decode(body);
             return (RSAPrivateKey) KeyFactory.getInstance("RSA")
-                    .generatePrivate(new PKCS8EncodedKeySpec(der));
+                .generatePrivate(new PKCS8EncodedKeySpec(der));
         } catch (Exception e) {
             throw new IllegalStateException(
-                    "app.jwt.private-key-b64 를 개인키로 읽지 못했습니다. "
-                            + "openssl 이 만든 PKCS#8 형식 PEM 을 Base64 로 감싼 값이어야 합니다", e);
+                "app.jwt.private-key-b64 를 개인키로 읽지 못했습니다. "
+                    + "openssl 이 만든 PKCS#8 형식 PEM 을 Base64 로 감싼 값이어야 합니다", e);
         }
     }
 
@@ -127,14 +132,14 @@ public class JwtEncoderConfig {
     private java.security.interfaces.RSAPublicKey toPublicKeyFrom(RSAPrivateKey privateKey) {
         try {
             java.security.interfaces.RSAPrivateCrtKey crtKey =
-                    (java.security.interfaces.RSAPrivateCrtKey) privateKey;
+                (java.security.interfaces.RSAPrivateCrtKey) privateKey;
             return (java.security.interfaces.RSAPublicKey) KeyFactory.getInstance("RSA")
-                    .generatePublic(new java.security.spec.RSAPublicKeySpec(
-                            crtKey.getModulus(), crtKey.getPublicExponent()));
+                .generatePublic(new java.security.spec.RSAPublicKeySpec(
+                    crtKey.getModulus(), crtKey.getPublicExponent()));
         } catch (Exception e) {
             throw new IllegalStateException(
-                    "개인키에서 공개키를 만들지 못했습니다. "
-                            + "openssl genpkey 가 만든 PKCS#8 개인키인지 확인하십시오", e);
+                "개인키에서 공개키를 만들지 못했습니다. "
+                    + "openssl genpkey 가 만든 PKCS#8 개인키인지 확인하십시오", e);
         }
     }
 }
