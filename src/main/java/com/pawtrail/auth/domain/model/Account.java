@@ -44,9 +44,11 @@ public class Account extends BaseEntity {
     // 로그인 아이디이자 계정 복구의 유일한 수단임
     // 소셜을 구글로 정해 이메일이 항상 확보되므로 not null 임
     //
-    // 변경 메서드를 두지 않음
+    // 사용자가 바꾸는 메서드는 두지 않음
     // 이메일 변경은 API 명세에 없고, 인증을 다시 받아야 하는 기능이라
     // 필요해질 때 따로 설계할 자리임
+    //
+    // 다만 탈퇴할 때는 이 값이 치환됨, 아래 withdraw 참고
     @Column(name = "email", nullable = false, unique = true, length = 255)
     private String email;
 
@@ -190,8 +192,30 @@ public class Account extends BaseEntity {
     // 행을 지우지 않고 상태만 바꿈
     // 실제 데이터 삭제는 account.withdrawn 이벤트를 받은 각 서비스가 자기 몫을 함
     // 되돌리는 것이 아니라 마저 지우는 방식이므로 보상 트랜잭션이 아님
+    //
+    // 행을 지우지 않고 남기는 이유 둘
+    //   이벤트 소비가 실패했을 때 "이 식별자가 정말 탈퇴한 것이 맞는지" 를 확인할 근거가 됨
+    //   refresh_token_log 가 가리키는 대상이 사라지지 않음
+    //
+    // 대신 식별자 둘을 끊음
+    //   email 은 치환하고 provider_user_id 는 비움
+    //   그래야 같은 주소와 같은 소셜 계정으로 다시 가입할 수 있음
+    //   끊지 않으면 email 이 UNIQUE 라 그 주소로 영영 돌아오지 못하고,
+    //   소셜은 제공자 식별자로 먼저 조회하므로 탈퇴한 행이 계속 잡혀 빠져나갈 방법이 없음
+    //
+    // 재가입은 새 식별자를 받는 별개 계정임
+    // 옛 즐겨찾기·후기·반려동물은 돌아오지 않음, 탈퇴가 곧 삭제이므로 그것이 맞는 동작임
     public void withdraw() {
         this.status = AccountStatus.WITHDRAWN;
+
+        // 치환값에 식별자를 섞는 것은 email 이 UNIQUE 이기 때문임
+        // 탈퇴한 계정이 여럿이어도 값이 겹치지 않아야 함
+        //
+        // .invalid 는 규격이 예약해 둔 최상위 도메인이라 실제로 존재할 수 없음
+        // 실수로 이 주소에 메일을 보내도 배달되지 않음
+        this.email = "withdrawn+" + this.id + "@pawtrail.invalid";
+
+        this.providerUserId = null;
     }
 
     // 로그인에 성공했을 때 시각을 남김

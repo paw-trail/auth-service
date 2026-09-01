@@ -1,5 +1,6 @@
 package com.pawtrail.auth.infrastructure.persistence;
 
+import com.pawtrail.auth.domain.provider.MailSender.MailPurpose;
 import com.pawtrail.auth.domain.repository.SendRateLimitStore;
 import java.time.Duration;
 import lombok.RequiredArgsConstructor;
@@ -27,6 +28,11 @@ import org.springframework.stereotype.Repository;
 @RequiredArgsConstructor
 public class SendRateLimitStoreImpl implements SendRateLimitStore {
 
+    // 키에 용도를 섞음
+    //
+    // mailcooldown:{용도}:{이메일} 형태가 되어 기능마다 따로 셈
+    // 섞지 않으면 가입 인증을 몇 번 받은 사람이 탈퇴를 못 하는 식으로
+    // 관계없는 기능이 서로의 한도를 깎음
     private static final String COOLDOWN_PREFIX = "mailcooldown:";
     private static final String HOURLY_PREFIX = "mailhourly:";
 
@@ -46,7 +52,7 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
     private final StringRedisTemplate redisTemplate;
 
     @Override
-    public boolean tryAcquire(String email) {
+    public boolean tryAcquire(MailPurpose purpose, String email) {
 
         // 쿨다운 자리를 먼저 잡습니다.
         //
@@ -54,7 +60,7 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
         // 중요한 것은 값이 아니라 "이 키를 내가 만들었는가" 이며,
         // 그 판단이 Redis 안에서 한 번에 끝나는 것이 이 방식의 전부입니다.
         Boolean acquired = redisTemplate.opsForValue()
-            .setIfAbsent(cooldownKey(email), "1", COOLDOWN);
+            .setIfAbsent(cooldownKey(purpose, email), "1", COOLDOWN);
 
         if (!Boolean.TRUE.equals(acquired)) {
             return false;
@@ -62,7 +68,7 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
 
         // 여기부터는 이 요청 하나만 지나갑니다.
         // 그래서 아래 카운터 읽기는 다른 요청과 겹치지 않습니다.
-        String count = redisTemplate.opsForValue().get(hourlyKey(email));
+        String count = redisTemplate.opsForValue().get(hourlyKey(purpose, email));
 
         if (count != null && Integer.parseInt(count) >= HOURLY_LIMIT) {
 
@@ -70,7 +76,7 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
             //
             // 보내지 않았는데 쿨다운을 물리면 그 값이 거짓말이 됩니다.
             // 돌려주어도 이 주소는 카운터에 막혀 있어 계속 거부되므로 안전합니다.
-            release(email);
+            release(purpose, email);
             return false;
         }
 
@@ -78,9 +84,9 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
     }
 
     @Override
-    public void recordSent(String email) {
+    public void recordSent(MailPurpose purpose, String email) {
 
-        Long count = redisTemplate.opsForValue().increment(hourlyKey(email));
+        Long count = redisTemplate.opsForValue().increment(hourlyKey(purpose, email));
 
         // increment 는 키가 없으면 만들면서 수명을 주지 않습니다.
         // 그대로 두면 이 키만 영원히 남고 시간당 제한이 평생 제한이 됩니다.
@@ -89,23 +95,23 @@ public class SendRateLimitStoreImpl implements SendRateLimitStore {
         // 마지막 발송이 아니라 그 시간대의 첫 발송입니다.
         // 창이 밀려나지 않아 계산이 단순하고, 한 시간이 지나면 카운터가 통째로 사라집니다.
         if (count != null && count == 1L) {
-            redisTemplate.expire(hourlyKey(email), HOURLY_WINDOW);
+            redisTemplate.expire(hourlyKey(purpose, email), HOURLY_WINDOW);
         }
     }
 
     @Override
-    public void release(String email) {
+    public void release(MailPurpose purpose, String email) {
 
         // 쿨다운만 지웁니다.
         // 시간당 카운터는 발송에 성공한 뒤에야 올라가므로 되돌릴 것이 없습니다.
-        redisTemplate.delete(cooldownKey(email));
+        redisTemplate.delete(cooldownKey(purpose, email));
     }
 
-    private String cooldownKey(String email) {
-        return COOLDOWN_PREFIX + email;
+    private String cooldownKey(MailPurpose purpose, String email) {
+        return COOLDOWN_PREFIX + purpose.key() + ":" + email;
     }
 
-    private String hourlyKey(String email) {
-        return HOURLY_PREFIX + email;
+    private String hourlyKey(MailPurpose purpose, String email) {
+        return HOURLY_PREFIX + purpose.key() + ":" + email;
     }
 }

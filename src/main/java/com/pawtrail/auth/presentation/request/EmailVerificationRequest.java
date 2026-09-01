@@ -7,7 +7,7 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
- * 인증 코드 관련 요청 세 가지입니다.
+ * 인증 코드 관련 요청 네 가지입니다.
  *
  * 한 파일에 모으는 것은 셋이 같은 흐름에 속하고 필드도 겹치기 때문입니다.
  * 흩어 두면 이메일 형식 규칙이 여러 파일에 복사됩니다.
@@ -42,6 +42,21 @@ public final class EmailVerificationRequest {
             //
             // 형식이 틀린 것을 여기서 걸러도 계정 정보가 새지 않습니다.
             // 어떤 이메일이 가입돼 있는지와 무관한 검사이기 때문입니다.
+            @NotBlank(message = "인증 코드를 입력해 주세요")
+            @Pattern(regexp = "\\d{6}", message = "인증 코드는 6자리 숫자입니다")
+            String code
+    ) {
+    }
+
+    /**
+     * 탈퇴하겠다는 요청입니다.
+     *
+     * 이메일을 받지 않습니다.
+     * 로그인한 사람만 부를 수 있고 그 사람의 주소는 계정에 있으므로,
+     * 받으면 남의 주소를 넣을 수 있는 자리만 하나 생깁니다.
+     */
+    public record Withdraw(
+
             @NotBlank(message = "인증 코드를 입력해 주세요")
             @Pattern(regexp = "\\d{6}", message = "인증 코드는 6자리 숫자입니다")
             String code
