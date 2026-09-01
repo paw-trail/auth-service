@@ -44,6 +44,22 @@ public record JwtProperties(String privateKeyB64,
                     "app.jwt.access-expiry 와 refresh-expiry 가 필요합니다. "
                             + "config 저장소의 auth-service.yml 을 확인하십시오");
         }
+
+        // 수명이 0 이하이면 기동을 막습니다.
+        //
+        // 값이 0 이면 발급되자마자 만료된 토큰이 나가는데, 그것으로 갱신을 시도하면
+        // 저장소에 남길 수명도 0 이 되어 토큰 교체가 중간에 실패합니다.
+        // 그때 옛 토큰만 사라지고 새 토큰이 남지 않아, 이어지는 갱신이 복제로 판정되고
+        // 계정의 토큰이 전부 폐기됩니다. 오류가 나지 않아 설정 문제라는 것이 드러나지 않습니다.
+        //
+        // 값을 1초로 올려 주는 식으로 넘기지 않는 것은 의도입니다.
+        // 그러면 잘못된 설정이 조용히 굴러가고, 나중에 "왜 로그인이 금방 풀리지" 로만 나타납니다.
+        if (accessExpiry.isZero() || accessExpiry.isNegative()
+                || refreshExpiry.isZero() || refreshExpiry.isNegative()) {
+            throw new IllegalStateException(
+                    "app.jwt.access-expiry 와 refresh-expiry 는 0보다 커야 합니다. "
+                            + "access=" + accessExpiry + ", refresh=" + refreshExpiry);
+        }
         if (issuer == null || issuer.isBlank()) {
             throw new IllegalStateException(
                     "app.jwt.issuer 가 비어 있습니다. config 저장소의 auth-service.yml 을 확인하십시오");

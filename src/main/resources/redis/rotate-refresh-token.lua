@@ -22,9 +22,27 @@
 -- KEYS[2]  refresh:{새jti}         활성화할 토큰
 -- KEYS[3]  refreshgrace:{옛jti}    동시 요청에게 내줄 자리
 --
--- ARGV[1]  새 토큰의 수명(초)
+-- ARGV[1]  새 토큰의 수명(초). 1 미만이면 아무것도 지우지 않고 오류를 냄
 -- ARGV[2]  새 리프레시 토큰 문자열
--- ARGV[3]  유예 시간(초)
+-- ARGV[3]  유예 시간(초). 같은 검사를 받음
+
+-- 수명을 먼저 확인함
+--
+-- SET 은 EX 값이 0 이하이면 오류를 냄
+-- 그런데 Redis 는 스크립트 중간에 난 오류를 되돌리지 않으므로,
+-- 아래 GETDEL 뒤에서 터지면 옛 토큰만 사라지고 새 토큰도 유예 항목도 안 남음
+-- 그 상태에서 다시 갱신하면 유예가 없어 복제로 판정되고 계정 전체가 폐기됨
+--
+-- 그래서 아무것도 지우기 전에 여기서 막음
+-- 지금 값으로는 새 토큰의 수명이 항상 14일이라 걸릴 일이 없으나,
+-- app.jwt.refresh-expiry 가 0 으로 잘못 들어가면 그렇게 됨
+local ttl = tonumber(ARGV[1])
+local graceTtl = tonumber(ARGV[3])
+
+if not ttl or ttl < 1 or not graceTtl or graceTtl < 1 then
+    return redis.error_reply(
+        '토큰 수명이 1초 미만입니다. app.jwt.refresh-expiry 와 app.auth.rotation-grace 를 확인하십시오')
+end
 
 local accountId = redis.call('GETDEL', KEYS[1])
 
