@@ -55,21 +55,28 @@ public record OAuthProperties(String frontendBaseUrl, Provider google) {
     }
 
     /**
-     * 경로 변수로 들어온 이름에 해당하는 설정을 찾습니다. 없으면 null 입니다.
+     * 경로 변수로 들어온 이름을 지원하는지 봅니다.
      *
      * 경로가 /oauth/{provider} 라 아무 값이나 들어올 수 있고,
      * 게이트웨이는 그 경로를 통째로 열어 두었을 뿐이라 판단하지 않습니다.
      * 지원 여부를 정하는 곳이 여기 하나여야 컨트롤러와 서비스가 같은 기준을 씁니다.
+     *
+     * 설정을 돌려주지 않고 참·거짓만 돌려주는 것은 부르는 쪽이 그것만 쓰기 때문입니다.
+     * 제공자 설정은 그 제공자의 구현체가 만들어질 때 이미 받아 갑니다.
      */
-    public Provider find(String provider) {
-        return GOOGLE.equals(provider) ? google : null;
+    public boolean supports(String provider) {
+        return GOOGLE.equals(provider);
     }
 
     /**
      * 경로 변수와 설정 이름으로 함께 쓰는 값입니다.
      *
      * 소문자인 것은 경로에 그대로 나타나기 때문입니다.
-     * 계정에 저장하는 AuthProvider.GOOGLE 과는 쓰이는 자리가 다릅니다.
+     *
+     * AuthProvider.GOOGLE 에서 이름을 뽑아 쓰지 않는 것은 의도입니다.
+     * 그렇게 하면 열거형 상수 이름을 바꾸는 순간 주소가 함께 바뀌는데,
+     * 그 연결이 코드에 드러나지 않아 알아채기 어렵습니다.
+     * TokenType 이 name 대신 값을 따로 둔 것과 같은 이유입니다.
      */
     public static final String GOOGLE = "google";
 
