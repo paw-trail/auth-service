@@ -5,19 +5,11 @@ import com.pawtrail.auth.application.support.AfterCommitExecutor;
 import com.pawtrail.auth.domain.event.payload.AccountCreatedEvent;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.model.Account;
-import com.pawtrail.auth.domain.model.RefreshTokenLog;
 import com.pawtrail.auth.domain.repository.AccountRepository;
-import com.pawtrail.auth.domain.repository.RefreshTokenLogRepository;
 import com.pawtrail.auth.domain.repository.EmailVerificationStore;
-import com.pawtrail.auth.domain.repository.RefreshTokenStore;
 import com.pawtrail.auth.infrastructure.security.TokenProvider;
 import com.pawtrail.common.exception.CustomException;
 import com.pawtrail.common.message.outbox.OutboxEventRecorder;
-import java.time.Duration;
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.util.UUID;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -37,13 +29,11 @@ import org.springframework.transaction.annotation.Transactional;
 public class AuthService {
 
     private final AccountRepository accountRepository;
-    private final RefreshTokenLogRepository refreshTokenLogRepository;
-    private final RefreshTokenStore refreshTokenStore;
     private final PasswordEncoder passwordEncoder;
-    private final TokenProvider tokenProvider;
     private final OutboxEventRecorder outboxEventRecorder;
     private final EmailVerificationStore emailVerificationStore;
     private final AfterCommitExecutor afterCommitExecutor;
+    private final TokenIssueService tokenIssueService;
 
     /**
      * 회원가입입니다.
@@ -156,52 +146,15 @@ public class AuthService {
             throw new CustomException(AuthErrorCode.ACCOUNT_WITHDRAWN);
         }
 
-        TokenProvider.IssuedToken accessToken =
-                tokenProvider.issueAccessToken(account.getId(), account.getRole());
-        TokenProvider.IssuedToken refreshToken =
-                tokenProvider.issueRefreshToken(account.getId(), account.getRole());
-
-        // 리프레시 토큰을 두 곳에 남깁니다. 목적이 다릅니다.
+        // 확인이 끝났으므로 로그인 한 번을 엶
         //
-        //   저장소   아직 쓸 수 있는 토큰인가를 판단합니다. 로그아웃하면 지웁니다
-        //   이력     언제 어디서 발급됐는가를 남깁니다. 지우지 않습니다
-        //
-        // 저장소 쪽만 커밋 뒤로 미룹니다. 이력은 데이터베이스라 트랜잭션에 함께 묶입니다.
-        Duration refreshTtl = Duration.between(Instant.now(), refreshToken.expiresAt());
-        afterCommitExecutor.run(
-                () -> refreshTokenStore.save(refreshToken.tokenId(), account.getId(), refreshTtl),
-                "리프레시 토큰 저장");
-
-        // 이 로그인 한 번을 묶는 값을 여기서 만듭니다.
-        //
-        // 갱신할 때마다 리프레시 토큰이 교체되면서 이력에 행이 하나씩 쌓이는데,
-        // 그 행들은 이 값을 그대로 물려받아 한 사슬이 됩니다.
-        // 없으면 기기가 둘 이상일 때 어느 행이 어느 로그인에서 시작됐는지 알 수 없고,
-        // 마지막 행의 발급 시각은 로그인 시각이 아니라 마지막 갱신 시각입니다.
-        //
-        // 인증 판단에는 쓰이지 않습니다. 이력을 사람이 읽을 때만 쓰는 값입니다.
-        UUID loginId = UUID.randomUUID();
-
-        refreshTokenLogRepository.save(RefreshTokenLog.issue(
-                account.getId(),
-                loginId,
-                refreshToken.tokenId(),
-                toLocalDateTime(Instant.now()),
-                toLocalDateTime(refreshToken.expiresAt()),
-                ipAddress,
-                userAgent));
-
-        account.updateLastLoginAt(LocalDateTime.now());
+        // 토큰 발급, 저장소와 이력 기록, 마지막 로그인 시각 갱신이 그 안에 있음
+        // 소셜 로그인도 사람을 찾는 방법만 다르고 이 뒤는 같아서 한곳에 모아 둠
+        TokenIssueService.IssuedSession session =
+                tokenIssueService.issue(account, ipAddress, userAgent);
 
         log.info("로그인 성공 accountId={}", account.getId());
-        return new LoginResult(AccountResponse.from(account), accessToken, refreshToken);
-    }
-
-    // 토큰은 Instant 로 시각을 다루고 엔티티는 LocalDateTime 을 씁니다.
-    //
-    // 컨테이너 시간대를 서울로 고정해 두었으므로 시스템 기본 시간대로 변환하면 맞습니다.
-    // 그 설정이 빠지면 아홉 시간이 어긋나는데 timestamp 컬럼이라 데이터베이스가 바로잡지 않습니다.
-    private LocalDateTime toLocalDateTime(Instant instant) {
-        return LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+        return new LoginResult(AccountResponse.from(account),
+                session.accessToken(), session.refreshToken());
     }
 }

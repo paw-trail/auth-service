@@ -1,6 +1,5 @@
 package com.pawtrail.auth.infrastructure.persistence;
 
-import com.pawtrail.auth.domain.enums.AuthProvider;
 import com.pawtrail.auth.domain.model.Account;
 import java.util.Optional;
 import java.util.UUID;
@@ -21,6 +20,5 @@ public interface JpaAccountRepository extends JpaRepository<Account, UUID> {
 
     boolean existsByEmail(String email);
 
-    Optional<Account> findByAuthProviderAndProviderUserId(AuthProvider authProvider,
-                                                          String providerUserId);
+    Optional<Account> findByProviderUserId(String providerUserId);
 }

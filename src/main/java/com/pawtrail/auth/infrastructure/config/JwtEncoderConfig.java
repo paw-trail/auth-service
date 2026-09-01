@@ -32,9 +32,17 @@ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
  * 이 클래스는 아무도 이름으로 참조하지 않는 설정 클래스이고,
  * 검증기를 다른 곳에서 만들면 키를 읽는 코드가 두 군데로 갈립니다.
  * 그 둘이 어긋나면 서명은 되는데 검증만 실패하는, 원인이 드러나지 않는 상태가 됩니다.
+ *
+ * 이름과 무관한 프로퍼티까지 여기서 등록하고 있습니다.
+ * ConfigurationProperties 는 붙이기만 해서는 빈이 되지 않아 어딘가에서 등록해야 하는데,
+ * 이 서비스는 그 자리가 여기 하나입니다.
+ * 새 프로퍼티를 만들면 아래 목록에 반드시 추가해야 하며,
+ * 빠뜨리면 기동할 때 NoSuchBeanDefinitionException 이 나고
+ * 메시지만으로는 등록 누락이라는 것이 드러나지 않습니다.
  */
 @Configuration
-@EnableConfigurationProperties({JwtProperties.class, AuthProperties.class, MailProperties.class})
+@EnableConfigurationProperties({JwtProperties.class, AuthProperties.class,
+        MailProperties.class, OAuthProperties.class})
 public class JwtEncoderConfig {
 
     /**

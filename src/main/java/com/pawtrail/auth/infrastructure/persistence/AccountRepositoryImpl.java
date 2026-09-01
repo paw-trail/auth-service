@@ -1,6 +1,5 @@
 package com.pawtrail.auth.infrastructure.persistence;
 
-import com.pawtrail.auth.domain.enums.AuthProvider;
 import com.pawtrail.auth.domain.model.Account;
 import com.pawtrail.auth.domain.repository.AccountRepository;
 import java.util.Optional;
@@ -46,8 +45,7 @@ public class AccountRepositoryImpl implements AccountRepository {
     }
 
     @Override
-    public Optional<Account> findByAuthProviderAndProviderUserId(AuthProvider authProvider,
-                                                                  String providerUserId) {
-        return jpaAccountRepository.findByAuthProviderAndProviderUserId(authProvider, providerUserId);
+    public Optional<Account> findByProviderUserId(String providerUserId) {
+        return jpaAccountRepository.findByProviderUserId(providerUserId);
     }
 }
