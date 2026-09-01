@@ -65,7 +65,7 @@ public class EmailVerificationService {
         //
         // 가입 인증은 이미 위에서 계정 존재 여부를 알려 주고 있으므로
         // 제한 사실을 숨길 이유가 없습니다. 그대로 알려 줍니다.
-        if (!sendRateLimitStore.tryAcquire(email)) {
+        if (!sendRateLimitStore.tryAcquire(MailSender.MailPurpose.SIGNUP, email)) {
             throw new CustomException(AuthErrorCode.MAIL_SEND_COOLDOWN);
         }
 
@@ -80,7 +80,7 @@ public class EmailVerificationService {
         } catch (RuntimeException e) {
             // 보내지 못했으므로 잡아 둔 자리를 돌려줍니다.
             // 그러지 않으면 메일이 오지도 않았는데 다음 시도가 쿨다운에 막힙니다.
-            sendRateLimitStore.release(email);
+            sendRateLimitStore.release(MailSender.MailPurpose.SIGNUP, email);
             throw e;
         }
 
@@ -88,7 +88,7 @@ public class EmailVerificationService {
         //
         // 발송을 시도조차 못 한 경우까지 세면
         // 메일 서버가 잠깐 죽었을 때 정상 사용자가 한도를 다 쓰고 막힙니다.
-        sendRateLimitStore.recordSent(email);
+        sendRateLimitStore.recordSent(MailSender.MailPurpose.SIGNUP, email);
     }
 
     /**

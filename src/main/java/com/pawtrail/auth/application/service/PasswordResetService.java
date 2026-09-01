@@ -75,7 +75,7 @@ public class PasswordResetService {
         //   그것만으로 "이 이메일은 앞서 요청된 적이 있다" 가 드러납니다.
         //   위에서 계정이 없는 경우를 조용히 접은 것과 같은 이유이며,
         //   응답이 갈리는 자리를 하나도 만들지 않는 것이 이 기능의 규칙입니다.
-        if (!sendRateLimitStore.tryAcquire(email)) {
+        if (!sendRateLimitStore.tryAcquire(MailSender.MailPurpose.PASSWORD_RESET, email)) {
             log.info("발송 제한에 걸린 요청입니다. 응답은 성공으로 보냅니다.");
             return;
         }
@@ -94,12 +94,12 @@ public class PasswordResetService {
             // 보낸 뒤에 기록합니다.
             // 발송이 실패한 경우까지 세면 메일 서버가 잠시 죽었을 때
             // 정상 사용자가 한도를 다 쓰고 막힙니다.
-            sendRateLimitStore.recordSent(email);
+            sendRateLimitStore.recordSent(MailSender.MailPurpose.PASSWORD_RESET, email);
 
         } catch (Exception e) {
             // 보내지 못했으므로 잡아 둔 자리를 돌려줍니다.
             // 그러지 않으면 메일이 오지도 않았는데 다음 요청이 쿨다운에 막힙니다.
-            sendRateLimitStore.release(email);
+            sendRateLimitStore.release(MailSender.MailPurpose.PASSWORD_RESET, email);
             log.error("재설정 메일 발송에 실패했습니다. 응답은 성공으로 보냅니다.", e);
         }
     }

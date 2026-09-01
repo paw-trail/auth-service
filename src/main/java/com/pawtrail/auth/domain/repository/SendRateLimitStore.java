@@ -1,19 +1,35 @@
 package com.pawtrail.auth.domain.repository;
 
+import com.pawtrail.auth.domain.provider.MailSender.MailPurpose;
+
 /**
  * 메일 발송 횟수를 세는 약속입니다.
  *
- * 가입 인증과 비밀번호 재설정이 같은 것을 씁니다.
- * 두 기능이 코드 저장소는 나눠 쓰지만, 발송을 막는 규칙은 완전히 같습니다.
+ * 가입 인증과 비밀번호 재설정과 탈퇴 인증이 같은 것을 씁니다.
+ * 세 기능이 코드 저장소는 나눠 쓰지만, 발송을 막는 규칙은 완전히 같습니다.
  *
  * 왜 필요한가
  *
- * 두 발송 경로 모두 인증이 필요 없어 누구나 계속 부를 수 있습니다.
+ * 앞의 두 경로는 인증이 필요 없어 누구나 계속 부를 수 있습니다.
  * 막지 않으면 두 가지가 일어납니다.
  *   남의 주소로 메일이 쏟아짐
  *   하루 발송 한도가 소진되어 정상 사용자도 메일을 받지 못함
  *
  * 발송 한도가 하루 500통뿐이라 뒤엣것이 특히 현실적입니다.
+ *
+ * 탈퇴 인증은 사정이 다릅니다.
+ * 로그인해야 부를 수 있고 자기 주소로만 가므로 위 두 가지가 성립하지 않습니다.
+ * 그런데도 세는 이유는 시도 횟수 제한을 지키기 위해서입니다.
+ *
+ * 코드를 다시 보내면 저장소가 코드를 덮어쓰면서 틀린 횟수를 0으로 되돌립니다.
+ * 발송을 막지 않으면 네 번 찍어보고 다시 보내는 것을 반복해
+ * 다섯 번이라는 상한이 아무것도 막지 못하게 됩니다.
+ *
+ * 왜 용도별로 세는가
+ *
+ * 한 주소에 하나의 카운터를 두면 서로 다른 기능이 한도를 나눠 쓰게 됩니다.
+ * 가입 인증을 몇 번 받은 사람이 탈퇴를 못 하는 식으로, 관계없는 기능이 서로를 막습니다.
+ * 용도가 다르면 한도도 따로 두는 것이 맞습니다.
  *
  * 두 가지를 함께 봅니다
  *
@@ -53,7 +69,7 @@ public interface SendRateLimitStore {
      * 이 메서드는 저장소의 값을 바꿉니다.
      * 참을 받았으면 반드시 recordSent 나 release 중 하나로 끝을 맺어야 합니다.
      */
-    boolean tryAcquire(String email);
+    boolean tryAcquire(MailPurpose purpose, String email);
 
     /**
      * 보냈다는 것을 기록합니다.
@@ -64,7 +80,7 @@ public interface SendRateLimitStore {
      * 시도만 하고 실패한 것까지 세면 메일 서버가 잠시 죽었을 때
      * 정상 사용자가 한도를 다 쓰고 막힙니다.
      */
-    void recordSent(String email);
+    void recordSent(MailPurpose purpose, String email);
 
     /**
      * 잡아 둔 자리를 돌려줍니다.
@@ -72,5 +88,5 @@ public interface SendRateLimitStore {
      * 발송이 실패했을 때 부릅니다.
      * 그러지 않으면 메일이 오지도 않았는데 다음 요청이 쿨다운에 막힙니다.
      */
-    void release(String email);
+    void release(MailPurpose purpose, String email);
 }

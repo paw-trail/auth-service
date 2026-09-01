@@ -7,6 +7,7 @@ import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.model.Account;
 import com.pawtrail.auth.domain.provider.MailSender;
 import com.pawtrail.auth.domain.repository.AccountRepository;
+import com.pawtrail.auth.domain.repository.SendRateLimitStore;
 import com.pawtrail.auth.domain.repository.WithdrawStore;
 import com.pawtrail.common.exception.CustomException;
 import com.pawtrail.common.message.outbox.OutboxEventRecorder;
@@ -51,6 +52,7 @@ public class WithdrawService {
 
     private final AccountRepository accountRepository;
     private final WithdrawStore withdrawStore;
+    private final SendRateLimitStore sendRateLimitStore;
     private final VerificationCodeGenerator codeGenerator;
     private final MailSender mailSender;
     private final AfterCommitExecutor afterCommitExecutor;
@@ -64,28 +66,56 @@ public class WithdrawService {
      * 받으면 남의 주소를 넣어 메일을 보내게 할 수 있고,
      * 로그인한 사람의 주소는 우리가 이미 알고 있으므로 받을 이유가 없습니다.
      *
-     * 발송 제한을 걸지 않습니다.
-     * 가입 인증과 재설정에 제한을 둔 이유는 두 경로가 인증 없이 열려 있어
-     * 누구나 남의 주소로 메일을 쏟을 수 있기 때문이었습니다.
-     * 이 경로는 로그인해야 부를 수 있고 자기 주소로만 가므로 그 근거가 성립하지 않습니다.
-     * 오히려 걸면 저장소의 키가 이메일 하나라 가입 인증과 한도를 나눠 쓰게 됩니다.
+     * 발송 제한을 겁니다.
      *
-     * @throws CustomException 계정이 없거나, 이미 탈퇴했거나, 발송에 실패한 경우입니다.
+     * 메일을 쏟는 것을 막으려는 것이 아닙니다.
+     * 이 경로는 로그인해야 부를 수 있고 자기 주소로만 가므로 그 걱정은 성립하지 않습니다.
+     *
+     * 막으려는 것은 시도 횟수 제한이 무력화되는 것입니다.
+     * 코드를 다시 보내면 저장소가 코드를 덮어쓰면서 틀린 횟수를 0으로 되돌리므로,
+     * 발송이 자유로우면 네 번 찍어보고 다시 보내는 것을 반복해
+     * 다섯 번이라는 상한이 아무것도 막지 못하게 됩니다.
+     *
+     * 한도는 용도별로 따로 셉니다. 가입 인증을 몇 번 받았다고 탈퇴가 막히면 안 됩니다.
+     *
+     * @throws CustomException 계정이 없거나, 이미 탈퇴했거나, 발송이 잦거나, 발송에 실패한 경우입니다.
      */
     @Transactional(readOnly = true)
     public void sendCode(UUID accountId) {
         Account account = findActiveAccount(accountId);
+        String email = account.getEmail();
+
+        // 보낼 자리를 먼저 잡음
+        //
+        // 묻지 않고 잡는 이유는, 물어보기만 하면 그 뒤 발송에 걸리는 몇 초 동안
+        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문임
+        //
+        // 코드를 저장하기 전에 잡아야 함
+        // 순서가 반대면 제한에 걸린 요청도 이미 코드를 덮어써 틀린 횟수를 되돌린 뒤임
+        if (!sendRateLimitStore.tryAcquire(MailSender.MailPurpose.WITHDRAW, email)) {
+            throw new CustomException(AuthErrorCode.MAIL_SEND_COOLDOWN);
+        }
 
         String code = codeGenerator.generate();
-        withdrawStore.saveCode(account.getEmail(), code);
+        withdrawStore.saveCode(email, code);
 
         // 발송 실패를 그대로 알려 줌
         //
         // 재설정 쪽은 실패까지 삼키는데 거기는 계정 존재를 숨겨야 하기 때문임
         // 여기는 이미 로그인한 사람이라 숨길 것이 없고,
         // 오지 않는 코드를 기다리게 하는 것보다 실패를 아는 편이 나음
-        mailSender.sendVerificationCode(
-                account.getEmail(), code, MailSender.MailPurpose.WITHDRAW);
+        try {
+            mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.WITHDRAW);
+        } catch (RuntimeException e) {
+            // 보내지 못했으므로 잡아 둔 자리를 돌려줌
+            // 그러지 않으면 메일이 오지도 않았는데 다음 요청이 쿨다운에 막힘
+            sendRateLimitStore.release(MailSender.MailPurpose.WITHDRAW, email);
+            throw e;
+        }
+
+        // 보낸 뒤에 기록함
+        // 실패한 것까지 세면 메일 서버가 잠시 죽었을 때 정상 사용자가 한도를 다 쓰고 막힘
+        sendRateLimitStore.recordSent(MailSender.MailPurpose.WITHDRAW, email);
 
         log.info("탈퇴 인증 코드를 보냈습니다. accountId={}", accountId);
     }

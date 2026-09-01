@@ -25,19 +25,23 @@ public interface MailSender {
      *
      * 문자열 대신 열거형으로 두는 것은, 새 용도가 생겼을 때
      * 문구를 어디에 적어야 하는지가 한곳에 모여 있게 하기 위함입니다.
+     *
+     * 발송 제한도 이 값으로 갈립니다. 용도가 다르면 한도를 따로 세야 하기 때문입니다.
      */
     enum MailPurpose {
 
-        SIGNUP("이메일 인증", "이메일 인증을 완료해 주세요."),
-        PASSWORD_RESET("비밀번호 재설정", "비밀번호를 재설정하려면 아래 코드를 입력해 주세요."),
-        WITHDRAW("회원 탈퇴", "탈퇴를 진행하려면 아래 코드를 입력해 주세요.");
+        SIGNUP("이메일 인증", "이메일 인증을 완료해 주세요.", "signup"),
+        PASSWORD_RESET("비밀번호 재설정", "비밀번호를 재설정하려면 아래 코드를 입력해 주세요.", "pwreset"),
+        WITHDRAW("회원 탈퇴", "탈퇴를 진행하려면 아래 코드를 입력해 주세요.", "withdraw");
 
         private final String subject;
         private final String message;
+        private final String key;
 
-        MailPurpose(String subject, String message) {
+        MailPurpose(String subject, String message, String key) {
             this.subject = subject;
             this.message = message;
+            this.key = key;
         }
 
         public String subject() {
@@ -46,6 +50,17 @@ public interface MailSender {
 
         public String message() {
             return this.message;
+        }
+
+        /**
+         * 저장소 키에 섞어 쓰는 값입니다.
+         *
+         * name 을 그대로 쓰지 않는 것은, 상수 이름을 바꾸는 순간 저장소의 키가 함께 바뀌는데
+         * 그 연결이 코드에 드러나지 않기 때문입니다. TokenType 이 값을 따로 둔 것과 같은 이유입니다.
+         * 여기서는 키의 수명이 짧아 결과가 가볍지만, 판단을 자리마다 다르게 하지 않습니다.
+         */
+        public String key() {
+            return this.key;
         }
     }
 }
