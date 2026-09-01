@@ -2,6 +2,7 @@ package com.pawtrail.auth.infrastructure.persistence;
 
 import com.pawtrail.auth.domain.model.RefreshTokenLog;
 import com.pawtrail.auth.domain.repository.RefreshTokenLogRepository;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -25,6 +26,11 @@ public class RefreshTokenLogRepositoryImpl implements RefreshTokenLogRepository 
     @Override
     public Optional<RefreshTokenLog> findByTokenId(String tokenId) {
         return jpaRefreshTokenLogRepository.findByTokenId(tokenId);
+    }
+
+    @Override
+    public int revokeAllActive(UUID accountId, LocalDateTime revokedAt) {
+        return jpaRefreshTokenLogRepository.revokeAllActive(accountId, revokedAt);
     }
 
     @Override

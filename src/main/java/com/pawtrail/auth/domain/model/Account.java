@@ -11,6 +11,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -91,6 +92,19 @@ public class Account extends BaseEntity {
     @Column(name = "last_login_at")
     private LocalDateTime lastLoginAt;
 
+    // 이 시각 이후에 발급된 토큰만 유효함
+    //
+    // 리프레시 토큰은 Redis 의 refresh:{jti} 에 있어 계정으로 찾을 수 없음
+    // 계정별 jti 목록을 따로 들고 있는 방법도 있으나 그 목록은 토큰이 만료돼도
+    // 줄어들지 않아 쓰레기가 쌓이고 동기화할 곳이 두 군데가 됨
+    // 시각 하나만 올리면 지울 것이 없고 "모든 기기에서 로그아웃" 도 같은 방법으로 됨
+    //
+    // null 을 허용하지 않는 이유는 이 값을 읽는 자리가 갱신 요청마다 도는 경로이기 때문임
+    // null 을 허용하면 비교 앞에 null 검사가 붙는데 그것을 빠뜨려도 테스트는 통과하고
+    // 대신 모든 갱신이 그냥 통과해 버림
+    @Column(name = "tokens_valid_from", nullable = false)
+    private LocalDateTime tokensValidFrom;
+
     // 생성자를 감추고 정적 팩터리 두 개만 여는 이유
     //
     // 로컬 가입과 소셜 가입은 채우는 필드가 서로 다름
@@ -107,6 +121,12 @@ public class Account extends BaseEntity {
         this.providerUserId = providerUserId;
         this.role = Role.USER;
         this.status = AccountStatus.ACTIVE;
+
+        // 계정이 만들어지는 시각을 기준선으로 둠
+        // 이 계정에서 나올 토큰은 전부 이 시각 뒤에 발급되므로 아무것도 막지 않음
+        //
+        // 초 단위로 자르는 이유는 아래 isTokenValid 주석에 있음
+        this.tokensValidFrom = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS);
     }
 
     /**
@@ -191,6 +211,49 @@ public class Account extends BaseEntity {
                     "소셜 로그인 계정은 비밀번호를 가지지 않습니다. authProvider=" + this.authProvider);
         }
         this.passwordHash = newPasswordHash;
+    }
+
+    /**
+     * 이 시각보다 앞서 발급된 토큰을 모두 무효로 만듭니다.
+     *
+     * 비밀번호를 바꿨을 때와, 이미 교체된 토큰이 유예 시간이 지난 뒤에
+     * 다시 들어왔을 때 부릅니다. 뒤엣것은 토큰이 복제됐다는 뜻입니다.
+     *
+     * 지우는 것이 없습니다. 기준선 하나만 올리면 그 앞의 토큰이 전부 거부됩니다.
+     *
+     * @param at 보통 현재 시각입니다. 이 값보다 앞서 발급된 토큰이 거부됩니다.
+     */
+    public void revokeTokensBefore(LocalDateTime at) {
+        LocalDateTime next = at.truncatedTo(ChronoUnit.SECONDS);
+
+        // 기준선은 뒤로 물러나지 않음
+        //
+        // 과거 시각이 들어오면 이미 무효가 된 토큰이 되살아남
+        // 부르는 쪽이 실수로 옛 시각을 넘겨도 사고가 나지 않게 여기서 막음
+        if (next.isAfter(this.tokensValidFrom)) {
+            this.tokensValidFrom = next;
+        }
+    }
+
+    /**
+     * 그 시각에 발급된 토큰이 아직 유효한지 봅니다.
+     *
+     * @param issuedAt 토큰의 iat 입니다.
+     */
+    public boolean isTokenValid(LocalDateTime issuedAt) {
+
+        // 같은 초에 발급된 토큰은 유효한 것으로 봄
+        //
+        // JWT 의 iat 는 초 단위라 소수점 아래가 없음
+        // 기준선을 자르지 않고 비교하면 이런 일이 남
+        //   14:00:00.500 에 비밀번호를 바꿔 기준선이 그 값이 되고
+        //   14:00:00.900 에 새로 로그인해 받은 토큰의 iat 는 14:00:00 이 되어
+        //   방금 받은 토큰이 앞선 것으로 판정돼 거부됨
+        //
+        // 비밀번호를 바꾸고 바로 로그인하는 것은 흔한 흐름이라 이쪽을 막는 편이 나쁨
+        // 대신 기준선과 같은 초에 발급된 옛 토큰이 살아남는데
+        // 그 창은 1초 미만이고 그 안에 갱신 요청이 닿아야 하므로 감수함
+        return !issuedAt.isBefore(this.tokensValidFrom);
     }
 
     // 로그인할 수 있는 계정인지 봄

@@ -13,11 +13,13 @@ import java.util.Base64;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 
 /**
- * 토큰 서명기를 만드는 곳입니다.
+ * 토큰 서명기와 검증기를 만드는 곳입니다.
  *
  * 게이트웨이가 spring-security-oauth2-jose 로 검증하므로 발급도 같은 것을 씁니다.
  * 발급과 검증이 한 벌이면 알고리즘과 형식이 어긋날 여지가 줄어듭니다.
@@ -25,6 +27,11 @@ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
  * 서명을 직접 구현하지 않는 이유는 검증 쪽과 같습니다.
  * 헤더 구성, 알고리즘 표기, 만료 계산까지 규격대로 맞춰야 하는데
  * 그것을 손으로 하면 틀려도 토큰이 만들어지고 검증 단계에서야 드러납니다.
+ *
+ * 이름이 Encoder 인데 검증기까지 만드는 것은 의도입니다.
+ * 이 클래스는 아무도 이름으로 참조하지 않는 설정 클래스이고,
+ * 검증기를 다른 곳에서 만들면 키를 읽는 코드가 두 군데로 갈립니다.
+ * 그 둘이 어긋나면 서명은 되는데 검증만 실패하는, 원인이 드러나지 않는 상태가 됩니다.
  */
 @Configuration
 @EnableConfigurationProperties({JwtProperties.class, AuthProperties.class, MailProperties.class})
@@ -49,6 +56,26 @@ public class JwtEncoderConfig {
 
         JWKSource<SecurityContext> jwkSource = new ImmutableJWKSet<>(new JWKSet(jwk));
         return new NimbusJwtEncoder(jwkSource);
+    }
+
+    /**
+     * 토큰 검증기를 만듭니다.
+     *
+     * 이 서비스도 자기가 발급한 토큰을 읽어야 합니다.
+     * 갱신 요청으로 들어온 리프레시 토큰의 서명과 만료를 확인하고
+     * 그 안의 jti 와 발급 시각을 꺼내야 하기 때문입니다.
+     *
+     * 공개키를 설정으로 받지 않고 개인키에서 뽑습니다.
+     * 아래 toPublicKeyFrom 이 서명기에 쓰려고 이미 하고 있는 일이며,
+     * 따로 받으면 두 값이 짝이 맞는지를 사람이 챙겨야 합니다.
+     *
+     * withPublicKey 로 만들면 RS256 이 고정되어 알고리즘 혼동 공격이 막힙니다.
+     * 게이트웨이의 검증기도 같은 방식으로 만들어져 있습니다.
+     */
+    @Bean
+    public JwtDecoder jwtDecoder(JwtProperties properties) {
+        RSAPrivateKey privateKey = toPrivateKey(properties.privateKeyB64());
+        return NimbusJwtDecoder.withPublicKey(toPublicKeyFrom(privateKey)).build();
     }
 
     /**

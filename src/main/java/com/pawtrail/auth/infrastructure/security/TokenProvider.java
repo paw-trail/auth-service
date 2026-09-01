@@ -23,6 +23,11 @@ import org.springframework.stereotype.Component;
  * 서명은 RS256 으로 고정됩니다.
  * 게이트웨이의 검증기가 공개키로 만들어져 그 알고리즘만 받아들이므로,
  * 여기서 다른 것을 쓰면 모든 요청이 401 이 됩니다.
+ *
+ * 두 토큰에 종류를 표시합니다.
+ * 담는 내용이 같고 수명만 달라 표시가 없으면 서로를 대신 쓸 수 있습니다.
+ *   리프레시 토큰을 액세스 쿠키에 넣으면 갱신 경로를 한 번도 거치지 않고 오래 쓰입니다
+ *   액세스 토큰을 갱신 요청에 보내면 그 jti 가 저장소에 없어 복제로 오인됩니다
  */
 @Component
 @RequiredArgsConstructor
@@ -51,7 +56,7 @@ public class TokenProvider {
      * 이름은 설정에서 받습니다. 양쪽이 어긋나면 서명은 통과하는데 값이 비어 401 이 납니다.
      */
     public IssuedToken issueAccessToken(UUID accountId, Role role) {
-        return issue(accountId, role, jwtProperties.accessExpiry().getSeconds());
+        return issue(accountId, role, TokenType.ACCESS, jwtProperties.accessExpiry().getSeconds());
     }
 
     /**
@@ -61,10 +66,10 @@ public class TokenProvider {
      * 담는 내용을 줄이지 않는 이유는 갱신할 때 이 토큰만으로 새 액세스 토큰을 만들 수 있어야 하기 때문입니다.
      */
     public IssuedToken issueRefreshToken(UUID accountId, Role role) {
-        return issue(accountId, role, jwtProperties.refreshExpiry().getSeconds());
+        return issue(accountId, role, TokenType.REFRESH, jwtProperties.refreshExpiry().getSeconds());
     }
 
-    private IssuedToken issue(UUID accountId, Role role, long expirySeconds) {
+    private IssuedToken issue(UUID accountId, Role role, TokenType type, long expirySeconds) {
         Instant now = Instant.now();
         Instant expiresAt = now.plusSeconds(expirySeconds);
 
@@ -81,6 +86,11 @@ public class TokenProvider {
                 // claim(name, value) 로 넣으므로 sub 도 같은 방식으로 처리됩니다.
                 .claim(jwtProperties.claim().accountId(), accountId.toString())
                 .claim(jwtProperties.claim().role(), role.name())
+                // 토큰의 종류입니다.
+                //
+                // 게이트웨이는 access 만 통과시키고 갱신과 로그아웃은 refresh 만 받습니다.
+                // 이 값이 없던 때에는 둘을 바꿔 쓸 수 있었고 그것이 두 방향으로 샜습니다.
+                .claim(jwtProperties.claim().type(), type.value())
                 .build();
 
         // 알고리즘을 헤더에 명시합니다.

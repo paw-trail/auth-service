@@ -62,8 +62,12 @@ public record JwtProperties(String privateKeyB64,
      *
      * @param accountId 사용자 식별자를 넣을 이름입니다. 표준 항목인 sub 를 씁니다.
      * @param role      권한을 넣을 이름입니다. 표준에 없어 우리가 정한 이름입니다.
+     * @param type      토큰의 종류를 넣을 이름입니다.
+     *                  * 액세스와 리프레시가 담는 내용이 같고 수명만 달라 이 값이 없으면 구분할 수 없습니다
+     *                    구분하지 않으면 리프레시 토큰을 액세스 쿠키에 넣어 오래 쓸 수 있고,
+     *                    액세스 토큰을 갱신 요청에 보내면 복제로 오인되어 계정이 통째로 잠깁니다
      */
-    public record ClaimNames(String accountId, String role) {
+    public record ClaimNames(String accountId, String role, String type) {
 
         /**
          * 두 이름이 비어 있으면 기동을 막습니다.
@@ -85,6 +89,11 @@ public record JwtProperties(String privateKeyB64,
                 throw new IllegalStateException(
                         "app.jwt.claim.role 이 비어 있습니다. "
                                 + "게이트웨이의 app.jwt.claim.role 과 같은 값이어야 합니다");
+            }
+            if (type == null || type.isBlank()) {
+                throw new IllegalStateException(
+                        "app.jwt.claim.type 이 비어 있습니다. "
+                                + "게이트웨이의 app.jwt.claim.type 과 같은 값이어야 합니다");
             }
         }
     }

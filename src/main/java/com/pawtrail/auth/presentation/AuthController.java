@@ -3,7 +3,9 @@ package com.pawtrail.auth.presentation;
 import com.pawtrail.auth.application.dto.response.AccountResponse;
 import com.pawtrail.auth.application.service.AuthService;
 import com.pawtrail.auth.application.service.EmailVerificationService;
+import com.pawtrail.auth.application.service.LogoutService;
 import com.pawtrail.auth.application.service.PasswordResetService;
+import com.pawtrail.auth.application.service.RefreshService;
 import com.pawtrail.auth.infrastructure.security.CookieFactory;
 import com.pawtrail.auth.presentation.request.EmailVerificationRequest;
 import com.pawtrail.auth.presentation.request.LoginRequest;
@@ -17,6 +19,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -36,6 +39,8 @@ import org.springframework.web.bind.annotation.RestController;
 public class AuthController {
 
     private final AuthService authService;
+    private final RefreshService refreshService;
+    private final LogoutService logoutService;
     private final EmailVerificationService emailVerificationService;
     private final PasswordResetService passwordResetService;
     private final CookieFactory cookieFactory;
@@ -105,6 +110,72 @@ public class AuthController {
                 .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
                 .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
                 .body(CommonApiResponse.success(result.account()));
+    }
+
+    /**
+     * 액세스 토큰을 다시 발급합니다.
+     *
+     * 이 경로는 인증 없이 열려 있습니다.
+     * 액세스 토큰이 만료된 상태로 부르는 요청이라 인증을 걸면 아무도 갱신할 수 없습니다.
+     *
+     * 리프레시 토큰도 함께 새로 발급되어 쿠키 두 개가 모두 갱신됩니다.
+     * 응답 바디는 비어 있습니다.
+     * 프론트가 이것을 부르는 자리는 401 인터셉터 안이고 거기서 필요한 것은 새 쿠키뿐이며,
+     * 로그인 여부는 GET /auth/me 로만 판단한다는 규칙을 흐리지 않기 위해서입니다.
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<CommonApiResponse<Void>> refresh(
+            @CookieValue(name = CookieFactory.REFRESH_TOKEN, required = false)
+            String refreshTokenValue,
+            HttpServletRequest servletRequest) {
+
+        RefreshService.RefreshResult result = refreshService.refresh(
+                refreshTokenValue,
+                // 로그인과 같은 이유로 아직 비워 둡니다.
+                // X-Forwarded-For 를 무엇으로 읽을지 정해지면 그때 함께 채웁니다.
+                null,
+                servletRequest.getHeader(HttpHeaders.USER_AGENT));
+
+        ResponseCookie accessCookie = cookieFactory.accessToken(
+                result.accessToken(), result.accessExpiresAt());
+        ResponseCookie refreshCookie = cookieFactory.refreshToken(
+                result.refreshToken(), result.refreshExpiresAt());
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
+                .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 로그아웃입니다.
+     *
+     * 어떤 경우에도 성공으로 응답합니다.
+     * 쿠키가 없어도, 토큰이 만료됐어도, 읽을 수 없는 값이어도 마찬가지입니다.
+     * 여기서 401 을 내보내면 클라이언트가 지우지 못하는 쿠키를 들고 갇힙니다.
+     *
+     * 지우는 쿠키의 속성은 만들 때와 같아야 합니다.
+     * 경로가 다르면 브라우저가 다른 쿠키로 보아 원래 것이 그대로 남는데,
+     * 오류가 나지 않으므로 "로그아웃했는데 토큰이 살아 있는" 상태를 알아채기 어렵습니다.
+     * CookieFactory 가 만들 때와 같은 값으로 만료 쿠키를 찍어 주는 것이 그 때문입니다.
+     *
+     * 액세스 토큰은 되돌릴 수 없어 만료까지 그대로 쓸 수 있습니다.
+     * 쿠키를 지우면 브라우저에서는 사라지지만 이미 복사된 값까지 막지는 못하며,
+     * 수명을 30분으로 짧게 둔 것이 유일한 대응입니다.
+     */
+    @PostMapping("/logout")
+    public ResponseEntity<CommonApiResponse<Void>> logout(
+            @CookieValue(name = CookieFactory.REFRESH_TOKEN, required = false)
+            String refreshTokenValue) {
+
+        logoutService.logout(refreshTokenValue);
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireAccessToken().toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireRefreshToken().toString())
+                .body(CommonApiResponse.success(null));
     }
 
     /**
