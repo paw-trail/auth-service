@@ -43,13 +43,13 @@ import org.springframework.transaction.annotation.Transactional;
  * 그때는 앞서 발급한 토큰을 그대로 다시 내줍니다. 두 요청이 같은 결과를 받아야 하기 때문입니다.
  * 시간이 지난 뒤의 재사용만 복제로 보고 그 계정의 토큰을 전부 폐기합니다.
  *
- * 순서가 이 기능의 핵심입니다
+ * 교체가 한 덩어리인 것이 이 기능의 핵심입니다
  *
- * 자리를 먼저 잡고 그다음에 토큰을 씁니다.
- * 반대로 하면 토큰을 쓴 순간부터 자리가 놓일 때까지 아무 흔적도 없는 구간이 생기고,
- * 동시에 들어온 요청이 그 구간에 닿으면 아무 잘못 없이 복제로 판정됩니다.
- * 그 구간을 최대한 줄여 봤지만 병렬 요청 두 개에 계속 걸렸습니다.
- * 자리를 먼저 잡으면 판정이 한 번에 갈려 그 구간 자체가 없어집니다.
+ * 옛 토큰을 써 버리는 것과 새 토큰을 활성화하는 것과 유예 항목을 남기는 것을 나누면,
+ * 그 중간 상태를 본 요청이 아직 쓸 수 없는 토큰을 받아 갑니다.
+ * 그 토큰으로 다시 갱신하면 저장소에 없으므로 복제로 판정되어 계정이 폐기됩니다.
+ * 중간 구간을 줄이는 방식으로 두 번 고쳐 봤지만 병렬 요청 검증에서 두 번 다 깨졌고,
+ * 저장소가 그 셋을 한 번에 처리하도록 바꾼 뒤에야 통과했습니다.
  */
 @Slf4j
 @Service
@@ -94,9 +94,8 @@ public class RefreshService {
 
         // 계정 확인을 저장소보다 먼저 함
         //
-        // 순서가 반대이면 사고가 남
-        // 아래에서 자리를 잡거나 토큰을 써 버린 뒤에 계정 검사로 걸려 예외를 던지면
-        // 저장소만 바뀐 채로 요청이 끝나고, 같은 토큰으로 들어온 다음 요청의 판정이 뒤틀림
+        // 순서가 반대이면 저장소만 바뀐 채로 예외가 나가고
+        // 같은 토큰으로 들어온 다음 요청의 판정이 뒤틀림
         Account account = accountRepository.findById(info.accountId())
                 .orElseThrow(() -> {
                     // 우리가 발급한 토큰인데 그 계정이 없는 경우라 정상이 아님
@@ -117,88 +116,71 @@ public class RefreshService {
             throw new CustomException(AuthErrorCode.INVALID_REFRESH_TOKEN);
         }
 
-        // 토큰을 먼저 만듦
-        //
-        // 자리를 잡을 때 새 토큰을 함께 남겨야 하므로 그 전에 있어야 함
-        // 자리를 못 잡으면 여기서 만든 것은 버려지는데, 저장소에 넣기 전이라 아무 데도 남지 않음
         TokenProvider.IssuedToken accessToken =
                 tokenProvider.issueAccessToken(account.getId(), account.getRole());
         TokenProvider.IssuedToken refreshToken =
                 tokenProvider.issueRefreshToken(account.getId(), account.getRole());
 
-        // 교체할 자리를 잡음
+        // 교체를 시도함
         //
-        // Redis 안에서 한 번에 갈리므로 동시에 들어온 요청 중 하나만 참을 받음
-        // 진 요청은 이긴 쪽이 남긴 토큰을 그대로 받아 가며, 여기서는 401 이 나올 수 없음
-        boolean acquired = refreshTokenStore.saveGraceIfAbsent(
-                info.tokenId(), refreshToken.value(), authProperties.rotationGrace());
+        // 옛 토큰 소비 · 새 토큰 활성화 · 유예 항목 공개가 저장소에서 한 번에 처리됨
+        // 비어 있으면 옛 토큰이 이미 없었다는 뜻이고 저장소는 아무것도 바뀌지 않음
+        // 여기서 만든 토큰도 버려지는데 저장된 적이 없으므로 아무 데도 남지 않음
+        Duration refreshTtl = Duration.between(Instant.now(), refreshToken.expiresAt());
 
-        if (!acquired) {
-            return handleConcurrentRefresh(info, account, accessToken);
+        Optional<UUID> rotated = refreshTokenStore.rotate(
+                info.tokenId(),
+                refreshToken.tokenId(),
+                refreshToken.value(),
+                refreshTtl,
+                authProperties.rotationGrace());
+
+        if (rotated.isEmpty()) {
+            return handleSpentToken(info, account, accessToken);
         }
 
-        // 자리를 잡았어도 그 토큰이 살아 있다는 뜻은 아님
-        // 유예가 지난 뒤의 재사용도 항목이 비어 있어 위에서 참을 받음
-        Optional<UUID> claimed = refreshTokenStore.claim(info.tokenId());
-
-        if (claimed.isEmpty()) {
-            return handleReusedToken(info, account);
-        }
-
-        return rotate(info, account, accessToken, refreshToken, ipAddress, userAgent);
+        return writeLog(info, account, accessToken, refreshToken, ipAddress, userAgent);
     }
 
     /**
-     * 다른 요청이 이미 같은 토큰을 교체하고 있을 때의 처리입니다.
+     * 이미 쓰인 토큰이 다시 들어왔을 때의 처리입니다.
      *
-     * 새로 발급하지 않고 그쪽이 남긴 토큰을 그대로 내보냅니다.
-     * 새로 발급하면 두 요청이 서로 다른 토큰을 받고, 나중에 응답한 쪽이 쿠키를 덮어써서
-     * 먼저 응답받은 쪽의 토큰이 주인을 잃습니다.
+     * 유예 항목이 있으면 경합이고 없으면 복제입니다.
      */
-    private RefreshResult handleConcurrentRefresh(TokenReader.RefreshTokenInfo info,
-                                                  Account account,
-                                                  TokenProvider.IssuedToken accessToken) {
+    private RefreshResult handleSpentToken(TokenReader.RefreshTokenInfo info, Account account,
+                                           TokenProvider.IssuedToken accessToken) {
 
         Optional<String> grace = refreshTokenStore.findGrace(info.tokenId());
 
-        if (grace.isEmpty()) {
-            // 자리는 잡혀 있었는데 값이 없는 경우임
+        if (grace.isPresent()) {
+            // 유예 시간 안의 재사용이므로 경합으로 봄
             //
-            // 자리를 잡지 못한 직후에 그 항목의 수명이 다한 아주 좁은 경계에서만 생김
-            // 복제라고 단정할 수 없으므로 폐기하지 않고 거부만 함
-            log.warn("교체 중인 토큰을 찾지 못했습니다. accountId={}", account.getId());
-            throw new CustomException(AuthErrorCode.INVALID_REFRESH_TOKEN);
+            // 새로 발급하지 않고 앞서 발급해 둔 것을 그대로 내보냄
+            // 새로 발급하면 두 요청이 서로 다른 토큰을 받고,
+            // 나중에 응답한 쪽이 쿠키를 덮어써서 먼저 응답받은 쪽의 토큰이 주인을 잃음
+            //
+            // 교체가 한 덩어리로 처리되므로 이 값이 보인다는 것은
+            // 그 안에 담긴 토큰이 이미 활성화되어 있다는 뜻이기도 함
+            //
+            // 액세스 토큰은 위에서 미리 만들어 둔 것을 그대로 씀
+            // 저장소에 기록되지 않는 값이라 여러 개가 살아 있어도 문제가 없음
+            String replacement = grace.get();
+            TokenReader.RefreshTokenInfo replacementInfo =
+                    tokenReader.readRefreshToken(replacement);
+
+            log.info("동시 갱신으로 보고 앞서 발급한 토큰을 다시 내보냅니다. accountId={}",
+                    account.getId());
+
+            return new RefreshResult(
+                    accessToken.value(), accessToken.expiresAt(),
+                    replacement, replacementInfo.expiresAt());
         }
 
-        // 액세스 토큰은 위에서 미리 만들어 둔 것을 그대로 씀
-        // 저장소에 기록되지 않는 값이라 여러 개가 살아 있어도 문제가 없고
-        // 유예 항목에 담아 두면 값이 둘이 되어 다룰 것이 늘어남
-        String replacement = grace.get();
-        TokenReader.RefreshTokenInfo replacementInfo = tokenReader.readRefreshToken(replacement);
-
-        log.info("동시 갱신으로 보고 앞서 발급한 토큰을 다시 내보냅니다. accountId={}",
-                account.getId());
-
-        return new RefreshResult(
-                accessToken.value(), accessToken.expiresAt(),
-                replacement, replacementInfo.expiresAt());
-    }
-
-    /**
-     * 유예가 지난 뒤에 다시 들어온 토큰을 처리합니다.
-     *
-     * 이 토큰을 들고 있는 쪽이 둘이라는 뜻이고 어느 쪽이 진짜인지 알 수 없습니다.
-     * 그래서 하나만 막지 않고 그 계정의 토큰을 전부 폐기해 다시 로그인하게 만듭니다.
-     */
-    private RefreshResult handleReusedToken(TokenReader.RefreshTokenInfo info, Account account) {
-
-        // 방금 잡은 자리를 돌려줌
+        // 유예가 지난 뒤의 재사용이므로 복제로 봄
         //
-        // 그대로 두면 뒤이은 재사용이 여기 담긴 토큰을 경합으로 받아 가는데
-        // 그 토큰은 저장소에 기록된 적이 없어 아무 데도 쓸 수 없음
-        // 쓸 수 없는 값을 성공으로 돌려주는 상태가 되어 원인을 짚기 어려워짐
-        refreshTokenStore.deleteGrace(info.tokenId());
-
+        // 이 토큰을 들고 있는 쪽이 둘이라는 뜻이고 어느 쪽이 진짜인지 알 수 없음
+        // 그래서 하나만 막지 않고 그 계정의 토큰을 전부 폐기해 다시 로그인하게 만듦
+        //
         // 폐기가 먼저 커밋되어야 하므로 새 트랜잭션으로 도는 쪽을 부름
         // 이 트랜잭션 안에서 하면 아래 예외에 딸려 함께 되돌아감
         //
@@ -211,23 +193,16 @@ public class RefreshService {
     }
 
     /**
-     * 토큰을 교체합니다.
+     * 교체된 사실을 이력에 남깁니다.
+     *
+     * 저장소는 이미 바뀐 뒤입니다. 여기서는 데이터베이스만 다룹니다.
+     * 커밋이 실패하면 저장소에는 새 토큰이 남고 이력 행만 없는 상태가 되는데,
+     * 토큰은 정상 동작하고 조사용 기록 한 줄이 비는 것이라 감수합니다.
      */
-    private RefreshResult rotate(TokenReader.RefreshTokenInfo info, Account account,
-                                 TokenProvider.IssuedToken accessToken,
-                                 TokenProvider.IssuedToken refreshToken,
-                                 String ipAddress, String userAgent) {
-
-        // 저장소를 지금 바로 고침. 커밋 뒤로 미루지 않음
-        //
-        // 로그인은 미루지만 여기는 다름
-        // 위에서 claim 이 옛 기록을 이미 지웠으므로 새 기록을 커밋 뒤로 미루면
-        // 그 사이에 이 토큰으로 갱신을 시도하는 요청이 아무것도 찾지 못함
-        //
-        // 대신 커밋이 실패하면 저장소에는 새 토큰이 남고 이력 행만 없는 상태가 됨
-        // 토큰은 정상 동작하고 조사용 기록 한 줄이 비는 것이라 앞의 위험보다 가벼움
-        Duration refreshTtl = Duration.between(Instant.now(), refreshToken.expiresAt());
-        refreshTokenStore.save(refreshToken.tokenId(), account.getId(), refreshTtl);
+    private RefreshResult writeLog(TokenReader.RefreshTokenInfo info, Account account,
+                                   TokenProvider.IssuedToken accessToken,
+                                   TokenProvider.IssuedToken refreshToken,
+                                   String ipAddress, String userAgent) {
 
         LocalDateTime now = LocalDateTime.now();
 

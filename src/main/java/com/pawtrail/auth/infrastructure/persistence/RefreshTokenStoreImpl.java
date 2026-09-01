@@ -2,10 +2,13 @@ package com.pawtrail.auth.infrastructure.persistence;
 
 import com.pawtrail.auth.domain.repository.RefreshTokenStore;
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Repository;
 
 /**
@@ -30,6 +33,16 @@ public class RefreshTokenStoreImpl implements RefreshTokenStore {
     // redis-cli 로 들여다볼 때도 무엇이 무엇인지 보이지 않음
     private static final String GRACE_PREFIX = "refreshgrace:";
 
+    // 교체를 한 덩어리로 처리하는 스크립트임
+    //
+    // 설정 클래스를 따로 만들지 않고 여기서 읽음
+    // 이 스크립트를 쓰는 곳이 아래 rotate 하나뿐이라 밖으로 낼 이유가 없음
+    //
+    // 스프링이 처음 실행할 때 스크립트를 서버에 올리고 그 해시를 기억함
+    // 그다음부터는 해시만 보내므로 본문이 매번 오가지 않음
+    private static final RedisScript<String> ROTATE_SCRIPT = RedisScript.of(
+            new ClassPathResource("redis/rotate-refresh-token.lua"), String.class);
+
     // 값은 문자열만 담으므로 StringRedisTemplate 을 씀
     //
     // RedisTemplate 은 기본 직렬화가 자바 직렬화라 값이 사람이 못 읽는 형태로 들어가고
@@ -46,23 +59,29 @@ public class RefreshTokenStoreImpl implements RefreshTokenStore {
     }
 
     @Override
-    public boolean saveGraceIfAbsent(String tokenId, String replacementToken, Duration ttl) {
+    public Optional<UUID> rotate(String oldTokenId, String newTokenId, String newTokenValue,
+                                 Duration ttl, Duration graceTtl) {
 
-        // "없을 때만 넣는다" 를 Redis 안에서 한 번에 처리함
+        // 옛 토큰 소비 · 새 토큰 활성화 · 유예 항목 공개를 스크립트 하나로 처리함
         //
-        // 같은 순간에 요청이 여럿 들어와도 참을 받는 것은 하나뿐임
-        // 이 자리에서 갈리므로 뒤따르는 교체 작업은 한 요청만 수행함
+        // 나눠서 하면 그 중간 상태가 다른 요청에 보임
+        // 특히 "유예 항목은 보이는데 새 토큰은 아직 없는" 구간이 위험한데,
+        // 그때 들어온 요청이 쓸 수 없는 토큰을 받아 가고
+        // 그것으로 다시 갱신하면 복제로 판정되어 계정 전체가 폐기됨
         //
-        // 메일 발송 제한에서 쓴 것과 같은 방법임
-        // 거기서도 "묻고 나서 기록" 을 "자리를 잡는다" 로 바꿔 경합을 없앴음
-        //
-        // 담는 값이 리프레시 토큰 문자열임
-        // 사용자의 쿠키에 이미 들어 있는 값이라 여기에 두는 것으로 새로 노출되지는 않고
-        // 수명도 짧아 오래 남지 않음
-        Boolean acquired = redisTemplate.opsForValue()
-                .setIfAbsent(graceKey(tokenId), replacementToken, ttl);
+        // 키 순서와 인자 순서는 스크립트 안의 KEYS · ARGV 와 짝을 이룸
+        // 어긋나면 엉뚱한 키를 지우는데 오류가 나지 않으므로 함께 고쳐야 함
+        String accountId = redisTemplate.execute(
+                ROTATE_SCRIPT,
+                List.of(key(oldTokenId), key(newTokenId), graceKey(oldTokenId)),
+                String.valueOf(ttl.toSeconds()),
+                newTokenValue,
+                String.valueOf(graceTtl.toSeconds()));
 
-        return Boolean.TRUE.equals(acquired);
+        if (accountId == null) {
+            return Optional.empty();
+        }
+        return Optional.of(UUID.fromString(accountId));
     }
 
     @Override
@@ -77,17 +96,11 @@ public class RefreshTokenStoreImpl implements RefreshTokenStore {
     }
 
     @Override
-    public void deleteGrace(String tokenId) {
-        redisTemplate.delete(graceKey(tokenId));
-    }
-
-    @Override
     public Optional<UUID> claim(String tokenId) {
 
         // 읽으면서 지움. Redis 안에서 한 번에 처리되는 명령임
         //
         // 확인과 삭제를 나누면 그 사이에 다른 요청이 같은 값을 읽고 지나갈 수 있음
-        // 그러면 같은 토큰으로 두 벌의 새 토큰이 발급되고 한 벌이 주인 없이 남음
         String value = redisTemplate.opsForValue().getAndDelete(key(tokenId));
 
         if (value == null) {
