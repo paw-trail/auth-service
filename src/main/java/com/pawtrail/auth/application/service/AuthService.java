@@ -146,10 +146,10 @@ public class AuthService {
             throw new CustomException(AuthErrorCode.ACCOUNT_WITHDRAWN);
         }
 
-        // 확인이 끝났으므로 로그인 한 번을 엽니다.
+        // 확인이 끝났으므로 로그인 한 번을 엶
         //
-        // 토큰 발급, 저장소와 이력 기록, 마지막 로그인 시각 갱신이 그 안에 있습니다.
-        // 소셜 로그인도 사람을 찾는 방법만 다르고 이 뒤는 같아서 한곳에 모아 두었습니다.
+        // 토큰 발급, 저장소와 이력 기록, 마지막 로그인 시각 갱신이 그 안에 있음
+        // 소셜 로그인도 사람을 찾는 방법만 다르고 이 뒤는 같아서 한곳에 모아 둠
         TokenIssueService.IssuedSession session =
                 tokenIssueService.issue(account, ipAddress, userAgent);
 
