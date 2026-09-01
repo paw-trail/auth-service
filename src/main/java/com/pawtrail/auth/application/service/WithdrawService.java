@@ -1,6 +1,5 @@
 package com.pawtrail.auth.application.service;
 
-import com.pawtrail.auth.application.support.AfterCommitExecutor;
 import com.pawtrail.auth.application.support.VerificationCodeGenerator;
 import com.pawtrail.auth.domain.event.payload.AccountWithdrawnEvent;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
@@ -9,6 +8,7 @@ import com.pawtrail.auth.domain.provider.MailSender;
 import com.pawtrail.auth.domain.repository.AccountRepository;
 import com.pawtrail.auth.domain.repository.SendRateLimitStore;
 import com.pawtrail.auth.domain.repository.WithdrawStore;
+import com.pawtrail.auth.domain.repository.WithdrawStore.ConsumeResult;
 import com.pawtrail.common.exception.CustomException;
 import com.pawtrail.common.message.outbox.OutboxEventRecorder;
 import java.util.UUID;
@@ -37,6 +37,10 @@ import org.springframework.transaction.annotation.Transactional;
  * 이메일은 어느 쪽이든 반드시 있고, 브라우저에 저장될 수 있는 비밀번호와 달리
  * 메일함은 따로 로그인해야 열립니다.
  *
+ * 코드를 대조하는 순간 그것을 써 버립니다.
+ * 읽고 나중에 지우면 같은 코드로 동시에 들어온 요청이 둘 다 통과해
+ * 탈퇴 이벤트가 두 건 발행됩니다. 계정 상태는 어느 쪽이든 같지만 흔적이 남습니다.
+ *
  * 이 서비스는 계정 존재를 숨기지 않습니다.
  * 두 경로 모두 로그인한 사람만 부를 수 있고 자기 계정만 다루므로 숨길 것이 없습니다.
  * 재설정 쪽이 모든 실패를 성공으로 응답하는 것과 갈리는 지점입니다.
@@ -55,7 +59,6 @@ public class WithdrawService {
     private final SendRateLimitStore sendRateLimitStore;
     private final VerificationCodeGenerator codeGenerator;
     private final MailSender mailSender;
-    private final AfterCommitExecutor afterCommitExecutor;
     private final OutboxEventRecorder outboxEventRecorder;
     private final TokenRevokeService tokenRevokeService;
 
@@ -139,7 +142,16 @@ public class WithdrawService {
         Account account = findActiveAccount(accountId);
         String email = account.getEmail();
 
+        // 코드를 대조하면서 써 버림
+        // 여기를 지나온 요청이 하나뿐이라는 것이 아래 이벤트가 한 번만 나가는 근거임
         verifyCode(email, inputCode);
+
+        // 시도 횟수를 지움
+        //
+        // 대조하는 스크립트는 코드 키만 지우므로 횟수 키가 남음
+        // 수명이 10분이라 저절로 사라지고 그 계정은 이미 탈퇴해 다시 쓸 일도 없으나,
+        // 실패 경로가 둘 다 지우는 것과 갈리면 "왜 여기만" 이 생김
+        withdrawStore.deleteCode(email);
 
         // 탈퇴 처리
         //
@@ -167,12 +179,6 @@ public class WithdrawService {
         // 다만 그 토큰으로 할 수 있는 일이 조회뿐이고 갱신은 여기서 끊김
         tokenRevokeService.revokeAll(accountId, "회원 탈퇴");
 
-        // 코드를 지움, 커밋 뒤에 실행됨
-        //
-        // Redis 는 롤백 대상이 아니라 여기서 바로 지우면
-        // 탈퇴가 실패했을 때 코드만 사라져 사용자가 다시 요청해야 함
-        afterCommitExecutor.run(() -> withdrawStore.deleteCode(email), "탈퇴 코드 삭제");
-
         log.info("탈퇴를 처리했습니다. accountId={}", accountId);
     }
 
@@ -198,19 +204,30 @@ public class WithdrawService {
     }
 
     /**
-     * 코드를 대조하고 틀린 횟수를 셉니다.
+     * 코드를 대조해 써 버리고, 틀렸으면 횟수를 셉니다.
      *
-     * 코드가 없는 경우와 틀린 경우에 같은 코드를 내보냅니다.
+     * 대조와 삭제가 저장소 안에서 한 번에 처리됩니다.
+     * 나눠서 하면 같은 코드로 동시에 들어온 요청이 둘 다 통과해,
+     * 계정 상태는 같아도 탈퇴 이벤트가 두 건 발행됩니다.
+     *
+     * 코드가 없는 경우와 틀린 경우에 같은 응답을 내보냅니다.
      * 나누면 "요청한 적이 있는지" 가 드러나는데, 그것을 알아서 좋을 사람이 없습니다.
+     * 다만 안에서는 갈라 다룹니다. 없는 코드에 시도 횟수를 세는 것은 의미가 없기 때문입니다.
      */
     private void verifyCode(String email, String inputCode) {
-        String saved = withdrawStore.findCode(email)
-                .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
+        ConsumeResult result = withdrawStore.consume(email, inputCode);
 
-        if (saved.equals(inputCode)) {
+        if (result == ConsumeResult.MATCHED) {
             return;
         }
 
+        // 만료됐거나 요청한 적이 없음
+        // 셀 횟수도 지울 코드도 없으므로 그대로 돌려보냄
+        if (result == ConsumeResult.NOT_FOUND) {
+            throw new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE);
+        }
+
+        // 틀렸음, 코드는 그대로 남아 있어 다시 시도할 수 있음
         int attempt = withdrawStore.increaseAttempt(email);
         if (attempt >= MAX_ATTEMPT) {
             // 횟수를 넘기면 코드를 지움

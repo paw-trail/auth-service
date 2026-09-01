@@ -1,7 +1,5 @@
 package com.pawtrail.auth.domain.repository;
 
-import java.util.Optional;
-
 /**
  * 탈퇴 인증 코드를 보관하는 약속입니다.
  *
@@ -16,16 +14,64 @@ import java.util.Optional;
  * 코드를 손에 넣은 사람이 할 수 있는 일이 "비밀번호 바꾸기" 에서
  * "계정 지우기" 로 넓어지는 것이라 접두사를 갈라 둡니다.
  *
- * 코드를 만들고 대조하고 횟수를 세는 로직은 VerificationCodeGenerator 가
- * 공유하므로 중복되는 것은 이 인터페이스의 메서드 이름뿐입니다.
+ * 대조와 삭제를 왜 한 메서드로 두는가
+ *
+ * 재설정 쪽은 코드를 읽어 비교하고 성공한 뒤에 지웁니다.
+ * 그 사이가 벌어져 있어 같은 코드로 동시에 들어온 요청이 둘 다 통과합니다.
+ * 재설정은 그래도 흔적이 남지 않습니다. 같은 비밀번호를 두 번 쓰고 끝이기 때문입니다.
+ *
+ * 탈퇴는 다릅니다. 상태 전이는 마찬가지로 멱등하지만
+ * account.withdrawn 이벤트가 두 건 발행되어 토픽에 남습니다.
+ * 그래서 여기서는 대조와 삭제를 한 번에 처리합니다.
  */
 public interface WithdrawStore {
 
+    /**
+     * 코드를 저장합니다. 같은 이메일로 다시 요청하면 이전 코드를 덮어씁니다.
+     *
+     * 시도 횟수도 함께 초기화합니다.
+     * 다시 요청했다는 것은 앞선 시도를 접었다는 뜻이므로 횟수를 물려받지 않습니다.
+     */
     void saveCode(String email, String code);
 
-    Optional<String> findCode(String email);
+    /**
+     * 코드를 대조하고, 맞았을 때만 지웁니다.
+     *
+     * 세 결과를 구분해 돌려줍니다.
+     * 틀린 경우와 없는 경우를 가르는 것은 시도 횟수를 셀지 정하기 위함입니다.
+     * 없는 코드에 횟수를 세는 것은 의미가 없고, 부르는 쪽이 내보내는 응답은 어느 쪽이든 같습니다.
+     *
+     * 틀렸을 때 지우지 않는 것이 중요합니다.
+     * 지우면 한 글자만 틀려도 진짜 코드가 사라져, 다섯 번까지 다시 시도할 수 있게 해 둔
+     * 장치가 통째로 의미를 잃습니다. 오타는 흔한 일이고 그때마다 메일을 다시 받아야 하는데
+     * 발송 제한이 1분을 막습니다.
+     */
+    ConsumeResult consume(String email, String inputCode);
 
+    /**
+     * 코드를 지웁니다. 시도 횟수를 넘겼을 때 부릅니다.
+     */
+    void deleteCode(String email);
+
+    /**
+     * 틀린 횟수를 하나 올리고 그 값을 돌려줍니다.
+     *
+     * 6자리 숫자는 백만 가지뿐이라 무차별 대입이 실제로 가능하므로 횟수를 셉니다.
+     */
     int increaseAttempt(String email);
 
-    void deleteCode(String email);
+    /**
+     * 코드를 대조한 결과입니다.
+     */
+    enum ConsumeResult {
+
+        // 맞았고 코드를 지움
+        MATCHED,
+
+        // 틀렸고 코드는 그대로 남음
+        MISMATCHED,
+
+        // 만료됐거나 요청한 적이 없음
+        NOT_FOUND
+    }
 }
