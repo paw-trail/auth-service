@@ -1,6 +1,6 @@
 package com.pawtrail.auth.application.service;
 
-import com.pawtrail.auth.application.dto.response.OutboxMessageResponse;
+import com.pawtrail.auth.application.dto.output.OutboxMessageOutput;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.common.exception.CustomException;
 import com.pawtrail.common.message.outbox.OutboxPublisher;
@@ -52,9 +52,9 @@ public class AdminOutboxService {
      * 서비스가 다른 숫자를 넘기면 포기 기준과 조회 기준이 어긋납니다.
      */
     @Transactional(readOnly = true)
-    public PageResponse<OutboxMessageResponse> findGivenUp(Pageable pageable) {
+    public PageResponse<OutboxMessageOutput> findGivenUp(Pageable pageable) {
         return PageResponse.from(
-                outboxRepository.findGivenUpMessages(pageable), OutboxMessageResponse::from);
+                outboxRepository.findGivenUpMessages(pageable), OutboxMessageOutput::from);
     }
 
     /**

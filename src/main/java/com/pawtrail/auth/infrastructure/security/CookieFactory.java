@@ -127,32 +127,32 @@ public class CookieFactory {
     private ResponseCookie.ResponseCookieBuilder base(String name, String value, String path,
                                                       long maxAgeSeconds, String sameSite) {
         ResponseCookie.ResponseCookieBuilder builder = ResponseCookie.from(name, value)
-                // 스크립트가 읽지 못하게 합니다. 이 방식의 핵심입니다.
+                // 스크립트가 읽지 못하게 함. 이 방식의 핵심임
                 .httpOnly(true)
 
                 // https 에서만 보냅니다.
                 //
                 // 프로파일마다 값이 다릅니다.
-                // 로컬은 http 라 켜면 쿠키가 실리지 않습니다.
+                // 로컬은 http 라 켜면 쿠키가 실리지 않음
                 // 브라우저는 localhost 를 예외로 두지만 curl 과 Postman 은 그렇지 않아
                 // 개발 중 요청을 직접 보낼 때 막힙니다.
                 .secure(authProperties.cookie().secure())
 
-                // 다른 사이트에서 시작된 요청에 이 쿠키를 실을지입니다.
+                // 다른 사이트에서 시작된 요청에 이 쿠키를 실을지를 정함
                 //
-                // 판정은 스킴과 도메인만 보고 포트는 보지 않습니다.
+                // 판정은 스킴과 도메인만 보고 포트는 보지 않음
                 // 그래서 로컬에서 프론트가 5173, 게이트웨이가 8080 이어도 같은 사이트로 취급되어
-                // 토큰 쿠키는 가장 좁은 값으로 두어도 동작합니다.
-                // 배포에서는 nginx 가 프론트와 API 를 같은 도메인으로 서빙하므로 문제가 없습니다.
+                // 토큰 쿠키는 가장 좁은 값으로 두어도 동작함
+                // 배포에서는 nginx 가 프론트와 API 를 같은 도메인으로 서빙하므로 문제가 없음
                 //
-                // 쿠키마다 값이 다른 이유는 위 상수 설명에 있습니다.
+                // 쿠키마다 값이 다른 이유는 위 상수 설명에 있음
                 .sameSite(sameSite)
 
                 .path(path)
                 .maxAge(Duration.ofSeconds(maxAgeSeconds));
 
         // 지정하지 않으면 요청한 호스트에만 적용됩니다.
-        // 하위 도메인이 여럿일 때만 값이 필요합니다.
+        // 하위 도메인이 여럿일 때만 값이 필요함
         String domain = authProperties.cookie().domain();
         if (domain != null && !domain.isBlank()) {
             builder.domain(domain);

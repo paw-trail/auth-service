@@ -1,5 +1,7 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.application.dto.input.LoginInput;
+import com.pawtrail.auth.application.dto.input.ClientInfo;
 import jakarta.validation.constraints.NotBlank;
 
 /**
@@ -20,4 +22,13 @@ public record LoginRequest(
         @NotBlank(message = "비밀번호를 입력해 주세요")
         String password
 ) {
+
+    /**
+     * 서비스가 받는 형태로 바꿉니다.
+     *
+     * 접속 정보는 요청 바디가 아니라 헤더에서 오므로 컨트롤러가 만들어 넣어 줍니다.
+     */
+    public LoginInput toInput(ClientInfo client) {
+        return new LoginInput(email, password, client);
+    }
 }

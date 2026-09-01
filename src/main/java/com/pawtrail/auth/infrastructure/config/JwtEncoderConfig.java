@@ -56,8 +56,8 @@ public class JwtEncoderConfig {
     public JwtEncoder jwtEncoder(JwtProperties properties) {
         RSAPrivateKey privateKey = toPrivateKey(properties.privateKeyB64());
 
-        // 공개키를 함께 넣지 않습니다.
-        // 서명에는 개인키만 있으면 되고, 검증은 게이트웨이가 자기 공개키로 합니다.
+        // 공개키를 함께 넣지 않음
+        // 서명에는 개인키만 있으면 되고, 검증은 게이트웨이가 자기 공개키로 함
         RSAKey jwk = new RSAKey.Builder(toPublicKeyFrom(privateKey))
                 .privateKey(privateKey)
                 .build();

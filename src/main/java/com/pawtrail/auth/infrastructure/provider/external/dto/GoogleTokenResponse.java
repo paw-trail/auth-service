@@ -1,4 +1,4 @@
-package com.pawtrail.auth.infrastructure.provider.client.dto;
+package com.pawtrail.auth.infrastructure.provider.external.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;

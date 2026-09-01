@@ -1,10 +1,10 @@
-package com.pawtrail.auth.infrastructure.provider;
+package com.pawtrail.auth.infrastructure.provider.external;
 
 import com.pawtrail.auth.domain.enums.AuthProvider;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.provider.OAuthClient;
 import com.pawtrail.auth.infrastructure.config.OAuthProperties;
-import com.pawtrail.auth.infrastructure.provider.client.dto.GoogleTokenResponse;
+import com.pawtrail.auth.infrastructure.provider.external.dto.GoogleTokenResponse;
 import com.pawtrail.common.exception.CustomException;
 import java.time.Duration;
 import java.util.List;

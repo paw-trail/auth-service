@@ -1,6 +1,8 @@
-package com.pawtrail.auth.presentation;
+package com.pawtrail.auth.presentation.controller;
 
+import com.pawtrail.auth.application.dto.input.OAuthCallbackInput;
 import com.pawtrail.auth.application.service.OAuthLoginService;
+import com.pawtrail.auth.presentation.support.ClientInfoFactory;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.infrastructure.config.OAuthProperties;
 import com.pawtrail.auth.infrastructure.security.CookieFactory;
@@ -141,16 +143,9 @@ public class OAuthController {
 
         OAuthLoginService.OAuthLoginResult result;
         try {
-            result = oAuthLoginService.callback(
-                    provider,
-                    code,
-                    state,
-                    cookieState,
-                    // 지금은 넣지 않음
-                    // 앞에 게이트웨이가 있어 getRemoteAddr 이 게이트웨이 주소를 돌려주며,
-                    // 원래 주소를 어떻게 얻을지는 nginx 를 붙일 때 함께 정함
-                    null,
-                    servletRequest.getHeader(HttpHeaders.USER_AGENT));
+            result = oAuthLoginService.callback(new OAuthCallbackInput(
+                    provider, code, state, cookieState,
+                    ClientInfoFactory.from(servletRequest)));
         } catch (CustomException e) {
             return handleFailure(e);
         } catch (Exception e) {

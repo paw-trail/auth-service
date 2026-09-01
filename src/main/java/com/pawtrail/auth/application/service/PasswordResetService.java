@@ -1,5 +1,6 @@
 package com.pawtrail.auth.application.service;
 
+import com.pawtrail.auth.application.dto.input.PasswordResetInput;
 import com.pawtrail.auth.application.support.AfterCommitExecutor;
 import com.pawtrail.auth.application.support.VerificationCodeGenerator;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
@@ -54,7 +55,7 @@ public class PasswordResetService {
 
         Optional<Account> found = accountRepository.findByEmail(email);
 
-        // 대상이 아닌 세 경우를 여기서 조용히 접습니다.
+        // 대상이 아닌 세 경우를 여기서 조용히 접음
         //   계정이 없음
         //   탈퇴한 계정
         //   소셜 계정이라 비밀번호가 없음
@@ -65,16 +66,16 @@ public class PasswordResetService {
             return;
         }
 
-        // 보낼 자리를 잡습니다. 잡지 못하면 보내지 않습니다.
+        // 보낼 자리를 잡음. 잡지 못하면 보내지 않음
         //
         // 묻지 않고 잡는 이유는, 물어보기만 하면 그 뒤 발송에 걸리는 몇 초 동안
-        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문입니다.
+        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문임
         //
-        // *가입 인증과 달리 여기서는 예외를 던지지 않습니다.
+        // *가입 인증과 달리 여기서는 예외를 던지지 않음
         //   제한에 걸렸을 때만 다른 응답이 나가면,
         //   그것만으로 "이 이메일은 앞서 요청된 적이 있다" 가 드러납니다.
         //   위에서 계정이 없는 경우를 조용히 접은 것과 같은 이유이며,
-        //   응답이 갈리는 자리를 하나도 만들지 않는 것이 이 기능의 규칙입니다.
+        //   응답이 갈리는 자리를 하나도 만들지 않는 것이 이 기능의 규칙임
         if (!sendRateLimitStore.tryAcquire(MailSender.MailPurpose.PASSWORD_RESET, email)) {
             log.info("발송 제한에 걸린 요청입니다. 응답은 성공으로 보냅니다.");
             return;
@@ -87,11 +88,11 @@ public class PasswordResetService {
         //
         // 가입 인증과 정반대인데, 거기는 실패를 알려 주는 편이 낫지만
         // 여기서 500 을 내보내면 그것만으로 "이 이메일은 가입돼 있다" 가 드러납니다.
-        // 없는 이메일은 위에서 이미 돌아가 발송 자체를 시도하지 않기 때문입니다.
+        // 없는 이메일은 위에서 이미 돌아가 발송 자체를 시도하지 않기 때문임
         try {
             mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.PASSWORD_RESET);
 
-            // 보낸 뒤에 기록합니다.
+            // 보낸 뒤에 기록함
             // 발송이 실패한 경우까지 세면 메일 서버가 잠시 죽었을 때
             // 정상 사용자가 한도를 다 쓰고 막힙니다.
             sendRateLimitStore.recordSent(MailSender.MailPurpose.PASSWORD_RESET, email);
@@ -112,7 +113,9 @@ public class PasswordResetService {
      * 가입 인증이 표시를 남기는 것과 갈리는 지점입니다.
      */
     @Transactional
-    public void reset(String email, String inputCode, String newRawPassword) {
+    public void reset(PasswordResetInput input) {
+        String email = input.email();
+        String inputCode = input.code();
 
         String saved = passwordResetStore.findCode(email)
             .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
@@ -127,35 +130,35 @@ public class PasswordResetService {
             throw new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE);
         }
 
-        // 코드를 맞힌 시점에서 본인 확인은 끝났습니다.
+        // 코드를 맞힌 시점에서 본인 확인은 끝났음
         //
         // 여기서 계정을 못 찾는 것은 코드를 보낸 뒤에 탈퇴한 경우뿐이라 드뭅니다.
         // 그때는 숨길 이유가 없으므로 그대로 알려 줍니다.
         Account account = accountRepository.findByEmail(email)
             .orElseThrow(() -> new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND));
 
-        account.changePassword(passwordEncoder.encode(newRawPassword));
+        account.changePassword(passwordEncoder.encode(input.newPassword()));
 
         // 이전에 발급된 토큰을 전부 무효로 만듭니다.
         //
         // 비밀번호를 바꾸는 이유가 대개 "누가 내 계정에 들어온 것 같다" 인데,
         // 바꿔도 기존 세션이 살아 있으면 그 행위의 목적이 절반만 달성됩니다.
         //
-        // 같은 트랜잭션에서 돌아야 합니다.
+        // 같은 트랜잭션에서 돌아야 함
         // 새 트랜잭션으로 하면 계정을 데이터베이스에서 다시 읽어 고치는데,
-        // 여기 있는 인스턴스가 나중에 갱신되면서 그 값을 옛것으로 덮습니다.
+        // 여기 있는 인스턴스가 나중에 갱신되면서 그 값을 옛것으로 덮음
         //
-        // 이미 나가 있는 액세스 토큰은 이것으로 막히지 않습니다.
-        // 게이트웨이가 서명만 보고 통과시키므로 만료될 때까지(30분) 그대로 쓰입니다.
+        // 이미 나가 있는 액세스 토큰은 이것으로 막히지 않음
+        // 게이트웨이가 서명만 보고 통과시키므로 만료될 때까지(30분) 그대로 쓰임
         // 그 시간을 없애려면 게이트웨이가 매 요청마다 폐기 목록을 조회해야 하는데,
         // 그러면 액세스 토큰을 상태 없이 두기로 한 결정이 통째로 뒤집힙니다.
         tokenRevokeService.revokeAll(account.getId(), "비밀번호 재설정");
 
-        // 코드를 지웁니다. 한 번 쓰면 없어지는 값입니다.
+        // 코드를 지움. 한 번 쓰면 없어지는 값임
         //
-        // 커밋 뒤에 지우는 것은 Redis 가 롤백되지 않기 때문입니다.
+        // 커밋 뒤에 지우는 것은 Redis 가 롤백되지 않기 때문임
         // 여기서 바로 지우면 비밀번호 변경이 실패했을 때 코드만 사라져
-        // 사용자가 다시 요청해야 합니다.
+        // 사용자가 다시 요청해야 함
         afterCommitExecutor.run(() -> passwordResetStore.deleteCode(email), "재설정 코드 삭제");
 
         log.info("비밀번호를 재설정했습니다. accountId={}", account.getId());

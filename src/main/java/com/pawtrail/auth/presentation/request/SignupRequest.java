@@ -1,5 +1,6 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.application.dto.input.SignupInput;
 import com.pawtrail.auth.presentation.request.validation.MaxBytes;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -23,15 +24,15 @@ public record SignupRequest(
         @Size(max = 255, message = "이메일은 255자를 넘을 수 없습니다")
         String email,
 
-        // 길이만 제한하고 문자 조합은 강제하지 않습니다.
+        // 길이만 제한하고 문자 조합은 강제하지 않음
         //
         // * 조합을 강제하면 오히려 예측하기 쉬운 값이 양산됩니다
-        //   대문자와 특수문자를 요구하면 Password1! 같은 형태로 수렴합니다
-        //   미국 표준 기관도 조합 요구를 권장하지 않는 쪽으로 바뀌었습니다
+        //   대문자와 특수문자를 요구하면 Password1! 같은 형태로 수렴함
+        //   미국 표준 기관도 조합 요구를 권장하지 않는 쪽으로 바뀌었음
         //
         // * 상한을 글자 수와 바이트 수로 두 번 겁니다
         //   BCrypt 가 72바이트를 넘는 입력을 거부하는데 Size 는 글자 수만 세므로,
-        //   한글 25자처럼 글자 수는 적고 바이트는 큰 값이 그대로 통과합니다
+        //   한글 25자처럼 글자 수는 적고 바이트는 큰 값이 그대로 통과함
         //   그러면 형식 검증을 지난 요청이 해싱하는 자리에서 터져 500 이 나갑니다
         //   글자 수를 24로 줄이면 이 문제는 사라지지만 영문을 쓰는 사람이 손해를 봅니다
         @NotBlank(message = "비밀번호를 입력해 주세요")
@@ -39,14 +40,23 @@ public record SignupRequest(
         @MaxBytes(value = 72, message = "비밀번호가 너무 깁니다. 한글은 한 글자가 세 자리로 계산됩니다")
         String password,
 
-        // 중복을 허용합니다.
+        // 중복을 허용함
         //
         // 닉네임이 쓰이는 자리가 후기 작성자 표시 하나뿐이고
-        // 그것으로 사람을 찾거나 부르는 기능이 없기 때문입니다.
+        // 그것으로 사람을 찾거나 부르는 기능이 없기 때문임
         // 중복을 막으려면 가입 시점에 검사해야 하는데,
         // 그러면 auth 가 user 를 호출하게 되어 이벤트로 넘기는 구조가 무너집니다.
         @NotBlank(message = "닉네임을 입력해 주세요")
         @Size(min = 2, max = 20, message = "닉네임은 2자 이상 20자 이하여야 합니다")
         String nickname
 ) {
+
+    /**
+     * 서비스가 받는 형태로 바꿉니다.
+     *
+     * 검증은 여기까지가 끝이고 그 아래는 값만 흐릅니다.
+     */
+    public SignupInput toInput() {
+        return new SignupInput(email, password, nickname);
+    }
 }

@@ -1,5 +1,6 @@
 package com.pawtrail.auth.application.service;
 
+import com.pawtrail.auth.application.dto.input.OAuthCallbackInput;
 import com.pawtrail.auth.domain.event.payload.AccountCreatedEvent;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.model.Account;
@@ -111,13 +112,15 @@ public class OAuthLoginService {
      * 계정을 만드는 것과 이벤트를 기록하는 것이 한 트랜잭션 안에 있어야 합니다.
      * 나뉘면 "계정은 생겼는데 프로필이 안 생기는" 상태가 만들어집니다.
      *
-     * @param state       제공자가 그대로 돌려준 값입니다.
-     * @param cookieState 인가를 시작할 때 브라우저에 남긴 값입니다. 없으면 null 입니다.
+     * @param input 제공자 이름·인가 코드·state·쿠키에 남긴 state·접속 정보입니다.
      * @throws CustomException 확인에 실패했거나 탈퇴한 계정인 경우입니다.
      */
     @Transactional
-    public OAuthLoginResult callback(String provider, String code, String state,
-                                     String cookieState, String ipAddress, String userAgent) {
+    public OAuthLoginResult callback(OAuthCallbackInput input) {
+        String provider = input.provider();
+        String state = input.state();
+        String cookieState = input.cookieState();
+
         requireSupported(provider);
 
         // 이 흐름을 시작한 브라우저가 맞는지 먼저 봄
@@ -147,7 +150,7 @@ public class OAuthLoginService {
 
         // 인가 코드를 사용자 신원으로 바꿈
         // 서명, 발급자, 대상, nonce, 이메일 확인 여부를 여기서 전부 봄
-        OAuthClient.OAuthUser user = oAuthClient.exchange(code, nonce);
+        OAuthClient.OAuthUser user = oAuthClient.exchange(input.code(), nonce);
 
         Account account = accountRepository.findByProviderUserId(user.providerUserId())
                 .orElse(null);
@@ -176,7 +179,7 @@ public class OAuthLoginService {
         }
 
         TokenIssueService.IssuedSession session =
-                tokenIssueService.issue(account, ipAddress, userAgent);
+                tokenIssueService.issue(account, input.client());
 
         log.info("소셜 로그인 성공 accountId={}, provider={}, isNew={}",
                 account.getId(), provider, isNew);

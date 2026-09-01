@@ -66,8 +66,8 @@ public class TokenReader {
 
         Jwt jwt;
         try {
-            // 서명과 만료를 확인합니다.
-            // 만료된 토큰은 여기서 걸리므로 아래에서 다시 보지 않습니다.
+            // 서명과 만료를 확인함
+            // 만료된 토큰은 여기서 걸리므로 아래에서 다시 보지 않음
             jwt = jwtDecoder.decode(token);
         } catch (Exception e) {
             log.debug("리프레시 토큰을 읽지 못했습니다. reason={}", e.getMessage());
@@ -76,14 +76,14 @@ public class TokenReader {
 
         // 토큰의 종류를 봅니다.
         //
-        // 이 검사가 없으면 액세스 토큰을 여기로 보낼 수 있습니다.
+        // 이 검사가 없으면 액세스 토큰을 여기로 보낼 수 있음
         // 서명은 통과하는데 그 jti 는 저장소에 없으므로 복제로 판정되어
         // 계정의 토큰이 전부 폐기됩니다.
         // 액세스 토큰은 모든 요청에 실려 나가 리프레시보다 노출이 크므로
         // 그것을 주운 사람이 계정을 잠글 수 있게 됩니다.
         //
         // 종류가 아예 없는 토큰도 여기서 걸립니다.
-        // typ 을 넣기 전에 발급된 토큰이며 더는 받지 않습니다.
+        // typ 을 넣기 전에 발급된 토큰이며 더는 받지 않음
         String type = jwt.getClaimAsString(jwtProperties.claim().type());
         if (!TokenType.REFRESH.matches(type)) {
             log.debug("리프레시 토큰이 아닙니다. type={}", type);
@@ -97,9 +97,9 @@ public class TokenReader {
             Instant issuedAt = jwt.getIssuedAt();
             Instant expiresAt = jwt.getExpiresAt();
 
-            // 하나라도 비어 있으면 우리가 만든 토큰이 아니거나 설정이 어긋난 것입니다.
+            // 하나라도 비어 있으면 우리가 만든 토큰이 아니거나 설정이 어긋난 것임
             //
-            // 설정이 어긋나는 경우가 특히 조용합니다.
+            // 설정이 어긋나는 경우가 특히 조용함
             // claim 이름이 게이트웨이와 달라지면 서명은 통과하는데 값만 비는데,
             // 그대로 두면 아래에서 NullPointerException 이 나 500 이 됩니다.
             if (tokenId == null || accountId == null || role == null
@@ -114,14 +114,14 @@ public class TokenReader {
                     Role.valueOf(role),
                     tokenId,
                     // 이 서비스는 시각을 LocalDateTime 으로 다룹니다.
-                    // 컨테이너의 표준시가 Asia/Seoul 로 맞춰져 있어 기준이 한 곳입니다.
+                    // 컨테이너의 표준시가 Asia/Seoul 로 맞춰져 있어 기준이 한 곳임
                     LocalDateTime.ofInstant(issuedAt, ZoneId.systemDefault()),
                     expiresAt);
 
         } catch (CustomException e) {
             throw e;
         } catch (Exception e) {
-            // 식별자 형식이 틀렸거나 권한 이름이 우리 열거형에 없는 경우입니다.
+            // 식별자 형식이 틀렸거나 권한 이름이 우리 열거형에 없는 경우임
             log.warn("리프레시 토큰의 값을 해석하지 못했습니다. reason={}", e.getMessage());
             throw new CustomException(AuthErrorCode.INVALID_REFRESH_TOKEN);
         }

@@ -21,8 +21,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class VerificationCodeGenerator {
 
-    // 여섯 자리로 두는 이유는 사람이 옮겨 적을 수 있는 길이이기 때문입니다.
-    // 그 대신 백만 가지뿐이라 무차별 대입이 가능하므로 시도 횟수 제한이 반드시 함께 있어야 합니다.
+    // 여섯 자리로 두는 이유는 사람이 옮겨 적을 수 있는 길이이기 때문임
+    // 그 대신 백만 가지뿐이라 무차별 대입이 가능하므로 시도 횟수 제한이 반드시 함께 있어야 함
     private static final int CODE_LENGTH = 6;
     private static final int BOUND = 1_000_000;
 

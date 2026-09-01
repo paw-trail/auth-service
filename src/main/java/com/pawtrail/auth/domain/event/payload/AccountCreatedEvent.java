@@ -31,13 +31,13 @@ import java.util.UUID;
 public record AccountCreatedEvent(UUID accountId, String email, String nickname)
         implements DomainEvent {
 
-    // 아래 셋은 봉투를 만들 때만 쓰이고 payload 에는 실리지 않습니다.
-    // DomainEvent 가 @JsonIgnore 를 선언해 두었으므로 구현체가 그대로 물려받습니다.
+    // 아래 셋은 봉투를 만들 때만 쓰이고 payload 에는 실리지 않음
+    // DomainEvent 가 @JsonIgnore 를 선언해 두었으므로 구현체가 그대로 물려받음
 
     @Override
     public String getTopic() {
-        // infra 의 create-topics.sh 에 같은 이름이 있어야 합니다.
-        // 토픽 자동 생성을 꺼 두었으므로 없으면 발행이 실패합니다.
+        // infra 의 create-topics.sh 에 같은 이름이 있어야 함
+        // 토픽 자동 생성을 꺼 두었으므로 없으면 발행이 실패함
         return "account.created";
     }
 
@@ -48,7 +48,7 @@ public record AccountCreatedEvent(UUID accountId, String email, String nickname)
 
     @Override
     public String getAggregateId() {
-        // 파티션 키가 되어 같은 계정에 대한 이벤트의 순서를 보장합니다.
+        // 파티션 키가 되어 같은 계정에 대한 이벤트의 순서를 보장함
         return accountId.toString();
     }
 }

@@ -1,5 +1,6 @@
 package com.pawtrail.auth.application.service;
 
+import com.pawtrail.auth.application.dto.input.ClientInfo;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.model.Account;
 import com.pawtrail.auth.domain.model.RefreshTokenLog;
@@ -81,12 +82,11 @@ public class RefreshService {
      * 리프레시 토큰으로 새 토큰을 발급합니다.
      *
      * @param refreshTokenValue 쿠키에서 꺼낸 토큰 문자열입니다.
-     * @param ipAddress null 을 허용합니다. 무엇을 넣을지는 아직 정해지지 않았습니다.
-     * @param userAgent 브라우저가 보낸 값입니다.
+     * @param client 발급 이력에 남길 접속 정보입니다.
      * @throws CustomException 읽을 수 없거나, 이미 무효이거나, 복제로 판정된 토큰입니다.
      */
     @Transactional
-    public RefreshResult refresh(String refreshTokenValue, String ipAddress, String userAgent) {
+    public RefreshResult refresh(String refreshTokenValue, ClientInfo client) {
 
         // 서명과 만료와 종류를 확인함
         // 액세스 토큰을 여기로 보내는 것도 이 단계에서 걸림
@@ -139,7 +139,7 @@ public class RefreshService {
             return handleSpentToken(info, account, accessToken);
         }
 
-        return writeLog(info, account, accessToken, refreshToken, ipAddress, userAgent);
+        return writeLog(info, account, accessToken, refreshToken, client);
     }
 
     /**
@@ -202,7 +202,7 @@ public class RefreshService {
     private RefreshResult writeLog(TokenReader.RefreshTokenInfo info, Account account,
                                    TokenProvider.IssuedToken accessToken,
                                    TokenProvider.IssuedToken refreshToken,
-                                   String ipAddress, String userAgent) {
+                                   ClientInfo client) {
 
         LocalDateTime now = LocalDateTime.now();
 
@@ -227,8 +227,8 @@ public class RefreshService {
                 refreshToken.tokenId(),
                 now,
                 toLocalDateTime(refreshToken.expiresAt()),
-                ipAddress,
-                userAgent));
+                client.ipAddress(),
+                client.userAgent()));
 
         log.info("토큰을 갱신했습니다. accountId={}", account.getId());
 

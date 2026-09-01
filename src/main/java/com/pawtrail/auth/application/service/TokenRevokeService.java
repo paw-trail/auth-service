@@ -100,7 +100,7 @@ public class TokenRevokeService {
         Optional<Account> found = accountRepository.findById(accountId);
 
         if (found.isEmpty()) {
-            // 토큰에 든 식별자로 계정을 못 찾는 경우입니다.
+            // 토큰에 든 식별자로 계정을 못 찾는 경우임
             // 우리가 발급한 토큰인데 그 계정이 없는 것이라 정상적인 상황이 아닙니다.
             // 폐기할 대상이 없으므로 그대로 두고 사실만 남깁니다.
             log.warn("폐기할 계정을 찾지 못했습니다. accountId={}, reason={}", accountId, reason);

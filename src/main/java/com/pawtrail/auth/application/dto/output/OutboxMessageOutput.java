@@ -1,4 +1,4 @@
-package com.pawtrail.auth.application.dto.response;
+package com.pawtrail.auth.application.dto.output;
 
 import com.pawtrail.common.message.outbox.OutboxMessage;
 import java.time.LocalDateTime;
@@ -27,7 +27,7 @@ import java.util.UUID;
  * @param retryCount   Relay 가 몇 번 시도하고 포기했는지입니다.
  * @param lastError    마지막 실패 원인입니다. 없을 수도 있습니다.
  */
-public record OutboxMessageResponse(UUID id,
+public record OutboxMessageOutput(UUID id,
                                     UUID eventId,
                                     String topic,
                                     String aggregateType,
@@ -36,8 +36,8 @@ public record OutboxMessageResponse(UUID id,
                                     int retryCount,
                                     String lastError) {
 
-    public static OutboxMessageResponse from(OutboxMessage message) {
-        return new OutboxMessageResponse(
+    public static OutboxMessageOutput from(OutboxMessage message) {
+        return new OutboxMessageOutput(
                 message.getId(),
                 message.getEventId(),
                 message.getTopic(),

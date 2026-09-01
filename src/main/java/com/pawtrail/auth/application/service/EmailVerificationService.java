@@ -1,5 +1,6 @@
 package com.pawtrail.auth.application.service;
 
+import com.pawtrail.auth.application.dto.input.EmailVerifyInput;
 import com.pawtrail.auth.application.support.VerificationCodeGenerator;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.provider.MailSender;
@@ -26,9 +27,9 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class EmailVerificationService {
 
-    // 코드를 틀릴 수 있는 횟수입니다.
+    // 코드를 틀릴 수 있는 횟수임
     //
-    // 여섯 자리는 백만 가지라 다섯 번으로는 맞힐 수 없습니다.
+    // 여섯 자리는 백만 가지라 다섯 번으로는 맞힐 수 없음
     // 더 줄이면 오타 두세 번에 막히는 정상 사용자가 늘어납니다.
     private static final int MAX_ATTEMPT = 5;
 
@@ -49,22 +50,22 @@ public class EmailVerificationService {
     public void sendCode(String email) {
 
         // 탈퇴한 계정도 참으로 나옵니다.
-        // 행이 남아 있는 한 같은 이메일로 다시 가입할 수 없다는 뜻이며 그것이 의도입니다.
+        // 행이 남아 있는 한 같은 이메일로 다시 가입할 수 없다는 뜻이며 그것이 의도임
         if (accountRepository.existsByEmail(email)) {
             throw new CustomException(AuthErrorCode.EMAIL_ALREADY_EXISTS);
         }
 
-        // 보낼 자리를 잡습니다. 잡지 못하면 보내지 않습니다.
+        // 보낼 자리를 잡음. 잡지 못하면 보내지 않음
         //
-        // 이 경로는 인증이 필요 없어 누구나 계속 부를 수 있습니다.
+        // 이 경로는 인증이 필요 없어 누구나 계속 부를 수 있음
         // 여기서 막지 않으면 남의 주소로 메일이 쏟아지고,
         // 하루 발송 한도가 소진되어 정상 사용자도 메일을 못 받게 됩니다.
         //
         // 묻지 않고 잡는 이유는, 물어보기만 하면 그 뒤 발송에 걸리는 몇 초 동안
-        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문입니다.
+        // 저장소에 흔적이 없어 동시에 들어온 요청이 전부 통과하기 때문임
         //
         // 가입 인증은 이미 위에서 계정 존재 여부를 알려 주고 있으므로
-        // 제한 사실을 숨길 이유가 없습니다. 그대로 알려 줍니다.
+        // 제한 사실을 숨길 이유가 없음. 그대로 알려 줌
         if (!sendRateLimitStore.tryAcquire(MailSender.MailPurpose.SIGNUP, email)) {
             throw new CustomException(AuthErrorCode.MAIL_SEND_COOLDOWN);
         }
@@ -74,7 +75,7 @@ public class EmailVerificationService {
 
         try {
             // 발송이 실패하면 예외가 그대로 올라가 500 이 나갑니다.
-            // 사용자가 오지 않는 코드를 기다리는 것보다 실패를 아는 편이 낫습니다.
+            // 사용자가 오지 않는 코드를 기다리는 것보다 실패를 아는 편이 나음
             mailSender.sendVerificationCode(email, code, MailSender.MailPurpose.SIGNUP);
 
         } catch (RuntimeException e) {
@@ -84,7 +85,7 @@ public class EmailVerificationService {
             throw e;
         }
 
-        // 보낸 뒤에 기록합니다.
+        // 보낸 뒤에 기록함
         //
         // 발송을 시도조차 못 한 경우까지 세면
         // 메일 서버가 잠깐 죽었을 때 정상 사용자가 한도를 다 쓰고 막힙니다.
@@ -94,7 +95,9 @@ public class EmailVerificationService {
     /**
      * 코드를 확인하고 통과 표시를 남깁니다.
      */
-    public void verify(String email, String inputCode) {
+    public void verify(EmailVerifyInput input) {
+        String email = input.email();
+        String inputCode = input.code();
 
         String saved = emailVerificationStore.findCode(email)
             .orElseThrow(() -> new CustomException(AuthErrorCode.INVALID_VERIFICATION_CODE));
@@ -102,10 +105,10 @@ public class EmailVerificationService {
         if (!saved.equals(inputCode)) {
             int attempt = emailVerificationStore.increaseAttempt(email);
 
-            // 횟수를 넘기면 코드를 지웁니다. 다시 요청해야 합니다.
+            // 횟수를 넘기면 코드를 지움. 다시 요청해야 함
             //
             // 잠갔다 푸는 방식을 쓰지 않는 것은 해제 시각을 따로 관리해야 하고,
-            // 다시 요청하면 새 코드가 오므로 사용자가 막히지 않기 때문입니다.
+            // 다시 요청하면 새 코드가 오므로 사용자가 막히지 않기 때문임
             if (attempt >= MAX_ATTEMPT) {
                 emailVerificationStore.deleteCode(email);
                 log.warn("인증 시도 횟수를 넘겨 코드를 폐기했습니다.");
@@ -116,9 +119,9 @@ public class EmailVerificationService {
 
         // 맞혔으므로 코드를 지우고 통과 표시를 남깁니다.
         //
-        // 코드를 남겨 두면 같은 코드로 여러 번 통과할 수 있습니다.
+        // 코드를 남겨 두면 같은 코드로 여러 번 통과할 수 있음
         // 지금 구조에서는 표시를 다시 남기는 것뿐이라 해가 없지만,
-        // 한 번 쓰면 없어지는 것이 이 값의 뜻입니다.
+        // 한 번 쓰면 없어지는 것이 이 값의 뜻임
         emailVerificationStore.deleteCode(email);
         emailVerificationStore.markVerified(email);
     }

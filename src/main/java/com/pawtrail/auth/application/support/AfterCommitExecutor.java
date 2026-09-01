@@ -46,7 +46,7 @@ public class AfterCommitExecutor {
      */
     public void run(Runnable action, String description) {
 
-        // 트랜잭션이 없으면 그냥 바로 실행합니다.
+        // 트랜잭션이 없으면 그냥 바로 실행함
         //
         // 테스트에서 트랜잭션 없이 부르는 경우가 있는데,
         // 그때 조용히 건너뛰면 "실행됐다고 생각했는데 안 된" 상태가 됩니다.
@@ -61,7 +61,7 @@ public class AfterCommitExecutor {
                 try {
                     action.run();
                 } catch (Exception e) {
-                    // 여기서 던지면 이미 끝난 트랜잭션 밖으로 나가 아무도 받지 않습니다.
+                    // 여기서 던지면 이미 끝난 트랜잭션 밖으로 나가 아무도 받지 않음
                     // 남길 수 있는 것이 로그뿐이므로 무엇이 실패했는지를 적어 둡니다.
                     log.error("커밋 이후 작업에 실패했습니다: {}", description, e);
                 }
