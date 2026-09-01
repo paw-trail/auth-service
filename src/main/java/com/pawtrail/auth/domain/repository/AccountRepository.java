@@ -1,6 +1,5 @@
 package com.pawtrail.auth.domain.repository;
 
-import com.pawtrail.auth.domain.enums.AuthProvider;
 import com.pawtrail.auth.domain.model.Account;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,10 +37,20 @@ public interface AccountRepository {
     // 행이 남아 있는 한 같은 이메일로 다시 가입할 수 없다는 뜻이며 그것이 의도임
     boolean existsByEmail(String email);
 
-    // 소셜 계정을 찾음
+    // 제공자 식별자로 찾음
     //
-    // 제공자와 식별자를 함께 보는 이유는 서로 다른 제공자가 같은 값을 줄 수 있기 때문임
-    // 구글이라면 providerUserId 자리에 id_token 의 sub 가 들어감
-    Optional<Account> findByAuthProviderAndProviderUserId(AuthProvider authProvider,
-                                                          String providerUserId);
+    // 소셜 로그인이 계정을 찾는 첫 경로임
+    // 구글이라면 이 자리에 id_token 의 sub 가 들어가고, 로그인할 때마다 같은 값이 옴
+    //
+    // 제공자를 조건에 넣지 않는 이유
+    //
+    // 이미 있는 계정에 구글을 이으면 auth_provider 는 LOCAL 로 남음
+    // 비밀번호를 그대로 쓸 수 있어야 하기 때문임
+    // 그래서 (GOOGLE, sub) 조합으로 찾으면 이어 붙인 계정을 못 찾고,
+    // 그 사람은 로그인할 때마다 계정이 새로 만들어지려다 이메일 중복에 걸림
+    //
+    // 지금은 이을 수 있는 제공자가 구글뿐이라 식별자만으로 충분함
+    // 제공자를 늘리면 서로 다른 제공자가 같은 값을 줄 수 있으므로
+    // 그때는 계정과 제공자를 잇는 표를 따로 두게 됨
+    Optional<Account> findByProviderUserId(String providerUserId);
 }

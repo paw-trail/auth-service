@@ -214,6 +214,53 @@ public class Account extends BaseEntity {
     }
 
     /**
+     * 이미 있는 계정에 구글 계정을 잇습니다.
+     *
+     * 구글 식별자로는 못 찾았는데 같은 이메일의 계정이 있을 때 부릅니다.
+     * 이메일로 가입해 쓰던 사람이 나중에 구글 로그인을 누르면 이 경로로 옵니다.
+     *
+     * 이어도 되는 이유는 양쪽 다 이메일 소유가 확인된 상태이기 때문입니다.
+     * 이메일 가입은 인증 코드를 통과해야 하고, 구글은 확인한 이메일만 넘겨줍니다.
+     * 추측으로 잇는 것이 아니라 이미 확인된 사실 위에서 잇습니다.
+     *
+     * authProvider 를 바꾸지 않는 것이 중요합니다.
+     * GOOGLE 로 바꾸면 비밀번호를 가지지 않는 계정이 되어,
+     * 비밀번호가 그대로 남아 있는데도 그 사람이 비밀번호로 로그인할 수 없게 됩니다.
+     * 이 값은 "비밀번호를 쓰는 방식인가" 를 가리는 데 쓰이므로 LOCAL 이 맞습니다.
+     *
+     * 그 결과로 이 행만으로는 어느 제공자와 이어졌는지 알 수 없습니다.
+     * 지금은 이을 수 있는 제공자가 구글뿐이라 이름에 그것을 적었습니다.
+     * 카카오처럼 다른 제공자를 더하게 되면 계정과 제공자를 잇는 표를 따로 두어야 하며,
+     * 그때 이 메서드와 provider_user_id 컬럼이 함께 정리됩니다.
+     *
+     * @param providerUserId 구글 id_token 의 sub 입니다.
+     * @throws IllegalStateException 이미 다른 식별자와 이어져 있는 경우입니다.
+     */
+    public void linkGoogle(String providerUserId) {
+        if (providerUserId == null || providerUserId.isBlank()) {
+            throw new IllegalArgumentException("제공자 식별자가 비어 있습니다");
+        }
+
+        // 같은 값이면 아무 일도 하지 않음
+        //
+        // 두 요청이 거의 같은 때에 들어오면 둘 다 이 자리에 닿을 수 있음
+        // 결과가 같으므로 실패로 다룰 이유가 없고, 여러 번 불러도 같아야 하는 종류임
+        if (providerUserId.equals(this.providerUserId)) {
+            return;
+        }
+
+        // 다른 값과 이미 이어져 있으면 우리 코드가 잘못 부른 것임
+        //
+        // 식별자로 먼저 찾고 없을 때만 여기로 오므로 정상 흐름에서는 나올 수 없음
+        // 사용자 입력 오류가 아니라 계약 위반이라 CustomException 이 아님
+        if (this.providerUserId != null) {
+            throw new IllegalStateException(
+                    "이미 다른 제공자 식별자와 연결된 계정입니다. accountId=" + this.id);
+        }
+        this.providerUserId = providerUserId;
+    }
+
+    /**
      * 이 시각보다 앞서 발급된 토큰을 모두 무효로 만듭니다.
      *
      * 비밀번호를 바꿨을 때와, 이미 교체된 토큰이 유예 시간이 지난 뒤에
