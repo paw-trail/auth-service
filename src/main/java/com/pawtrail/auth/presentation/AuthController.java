@@ -1,6 +1,7 @@
 package com.pawtrail.auth.presentation;
 
 import com.pawtrail.auth.application.dto.response.AccountResponse;
+import com.pawtrail.auth.application.service.AccountService;
 import com.pawtrail.auth.application.service.AuthService;
 import com.pawtrail.auth.application.service.EmailVerificationService;
 import com.pawtrail.auth.application.service.LogoutService;
@@ -9,8 +10,11 @@ import com.pawtrail.auth.application.service.RefreshService;
 import com.pawtrail.auth.infrastructure.security.CookieFactory;
 import com.pawtrail.auth.presentation.request.EmailVerificationRequest;
 import com.pawtrail.auth.presentation.request.LoginRequest;
+import com.pawtrail.auth.presentation.request.PasswordChangeRequest;
 import com.pawtrail.auth.presentation.request.SignupRequest;
 import com.pawtrail.common.response.CommonApiResponse;
+import com.pawtrail.common.security.annotation.CurrentUser;
+import com.pawtrail.common.security.principal.CustomUserPrincipal;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -20,6 +24,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CookieValue;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -28,9 +34,14 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 인증 API 입니다.
  *
- * 이 경로들은 게이트웨이가 인증 헤더를 넣지 않고 통과시킵니다.
+ * 대부분의 경로는 게이트웨이가 인증 헤더를 넣지 않고 통과시킵니다.
  * 토큰을 받기 전에 불러야 하는 요청이기 때문이며,
  * 같은 목록이 config 저장소의 app.gateway.permit-all 과 app.auth.permit-all 양쪽에 있습니다.
+ *
+ * /me 로 시작하는 것들만 예외입니다.
+ * 이미 로그인한 사람이 자기 계정을 다루는 요청이라 인증이 필요하고,
+ * 그 값은 다른 서비스와 똑같이 게이트웨이가 넣어 준 헤더에서 옵니다.
+ * 이 서비스가 토큰을 발급하는 쪽이라고 해서 자기 요청의 토큰을 직접 파싱하지 않습니다.
  */
 @Slf4j
 @RestController
@@ -39,6 +50,7 @@ import org.springframework.web.bind.annotation.RestController;
 public class AuthController {
 
     private final AuthService authService;
+    private final AccountService accountService;
     private final RefreshService refreshService;
     private final LogoutService logoutService;
     private final EmailVerificationService emailVerificationService;
@@ -170,6 +182,52 @@ public class AuthController {
             String refreshTokenValue) {
 
         logoutService.logout(refreshTokenValue);
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireAccessToken().toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireRefreshToken().toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 내 계정 정보를 봅니다.
+     *
+     * 쿠키가 HttpOnly 라 프론트는 토큰 안을 읽을 수 없습니다.
+     * 그래서 로그인했는지, 누구로 로그인했는지를 확인하는 유일한 창구가 여기입니다.
+     *
+     * 로그인 응답과 같은 형태를 돌려줍니다.
+     * 프론트가 두 자리에서 같은 모양을 다루면 되고, 로그인 직후에 이것을 또 부를 필요도 없습니다.
+     */
+    @GetMapping("/me")
+    public ResponseEntity<CommonApiResponse<AccountResponse>> getMyAccount(
+            @CurrentUser CustomUserPrincipal principal) {
+
+        AccountResponse response = accountService.getMyAccount(principal.accountId());
+        return ResponseEntity.ok(CommonApiResponse.success(response));
+    }
+
+    /**
+     * 비밀번호를 바꿉니다.
+     *
+     * 비밀번호 재설정과 다른 기능입니다.
+     * 그쪽은 비밀번호를 잊은 사람이 메일로 본인을 증명하지만,
+     * 여기는 로그인한 사람이 현재 비밀번호로 증명합니다.
+     *
+     * 바꾸고 나면 쿠키를 지웁니다.
+     *
+     * 이전에 발급된 토큰이 전부 무효가 되는데 본인의 것도 거기 포함되기 때문입니다.
+     * 지우지 않으면 브라우저에 쓸 수 없는 쿠키가 남고, 사용자는 30분쯤 지나
+     * 갱신이 거부될 때가 되어서야 로그아웃된 것을 알게 됩니다.
+     * 지금 지우면 화면이 곧바로 로그인으로 넘어갑니다.
+     */
+    @PatchMapping("/me/password")
+    public ResponseEntity<CommonApiResponse<Void>> changePassword(
+            @CurrentUser CustomUserPrincipal principal,
+            @Valid @RequestBody PasswordChangeRequest request) {
+
+        accountService.changePassword(
+                principal.accountId(), request.currentPassword(), request.newPassword());
 
         return ResponseEntity
                 .ok()
