@@ -52,25 +52,36 @@ public class AccountService {
      * 닉네임은 담기지 않습니다. user_db 의 user_profile 이 소유자이며,
      * 그것까지 담으려면 auth 가 user 를 호출해야 해서 이 서비스가 남을 부르지 않는다는
      * 성질이 깨집니다. 프론트는 닉네임이 필요하면 GET /users/me 를 따로 부릅니다.
+     *
+     * 계정 상태도 담기지 않습니다.
+     * 응답 형태를 로그인과 함께 쓰는데 로그인은 탈퇴한 계정을 이미 막으므로,
+     * 그 필드는 로그인 응답에서 언제나 같은 값만 나가는 자리가 됩니다.
      */
     @Transactional(readOnly = true)
     public AccountResponse getMyAccount(UUID accountId) {
 
         Account account = accountRepository.findById(accountId)
-                .orElseThrow(() -> {
-                    // 게이트웨이가 넣어 준 식별자로 찾았는데 없는 경우임
-                    //
-                    // 토큰은 우리가 발급한 것이고 서명도 통과했는데 계정만 없는 상태라
-                    // 정상적인 상황이 아님. 데이터가 지워졌거나 다른 데이터베이스를 보고 있음
-                    log.warn("헤더의 계정을 찾지 못했습니다. accountId={}", accountId);
-                    return new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND);
-                });
+            .orElseThrow(() -> {
+                // 게이트웨이가 넣어 준 식별자로 찾았는데 없는 경우임
+                //
+                // 토큰은 우리가 발급한 것이고 서명도 통과했는데 계정만 없는 상태라
+                // 정상적인 상황이 아님. 데이터가 지워졌거나 다른 데이터베이스를 보고 있음
+                log.warn("헤더의 계정을 찾지 못했습니다. accountId={}", accountId);
+                return new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND);
+            });
 
-        // 탈퇴한 계정도 그대로 돌려줌
+        // 탈퇴한 계정도 조회 자체는 됨
         //
-        // 여기까지 왔다는 것은 탈퇴 전에 발급된 토큰이 아직 살아 있다는 뜻임
-        // 상태를 숨기면 프론트가 "왜 아무것도 안 되는지" 를 알 수 없으므로
-        // status 를 그대로 보여 주고 화면이 판단하게 함
+        // 여기까지 왔다는 것은 탈퇴 전에 발급된 액세스 토큰이 아직 살아 있다는 뜻임
+        // 탈퇴할 때 토큰을 전부 폐기하므로 갱신은 이미 막혀 있고,
+        // 남은 액세스 토큰도 만료되면 저절로 끊김
+        //
+        // 그 상태를 응답에 담지 않는 것은 프론트가 그것으로 할 일이 없기 때문임
+        // 탈퇴한 사람에게 보여 줄 화면이 따로 없고 되살리는 기능도 없으므로,
+        // 담아 두면 아무도 쓰지 않는 값이 하나 늘어날 뿐임
+        //
+        // 로그인 응답이 이 형태를 함께 쓰는 것도 이유임
+        // 로그인은 탈퇴한 계정을 이미 막으므로 거기서는 언제나 같은 값만 나감
         return AccountResponse.from(account);
     }
 
@@ -93,10 +104,10 @@ public class AccountService {
     public void changePassword(UUID accountId, String currentRawPassword, String newRawPassword) {
 
         Account account = accountRepository.findById(accountId)
-                .orElseThrow(() -> {
-                    log.warn("헤더의 계정을 찾지 못했습니다. accountId={}", accountId);
-                    return new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND);
-                });
+            .orElseThrow(() -> {
+                log.warn("헤더의 계정을 찾지 못했습니다. accountId={}", accountId);
+                return new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND);
+            });
 
         // 소셜 계정을 먼저 걸러냄
         //
