@@ -1,4 +1,4 @@
-package com.pawtrail.auth.application.dto.response;
+package com.pawtrail.auth.application.dto.output;
 
 import com.pawtrail.auth.domain.enums.AuthProvider;
 import com.pawtrail.auth.domain.model.Account;
@@ -17,13 +17,13 @@ import java.util.UUID;
  * 그것이 바로 hasPet 과 defaultPetId 를 뺀 이유였습니다.
  * 프론트는 닉네임이 필요하면 GET /users/me 를 부릅니다.
  */
-public record AccountResponse(UUID accountId,
+public record AccountOutput(UUID accountId,
                               String email,
                               Role role,
                               AuthProvider authProvider) {
 
-    public static AccountResponse from(Account account) {
-        return new AccountResponse(
+    public static AccountOutput from(Account account) {
+        return new AccountOutput(
                 account.getId(),
                 account.getEmail(),
                 account.getRole(),

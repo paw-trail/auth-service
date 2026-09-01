@@ -1,5 +1,6 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.application.dto.input.PasswordChangeInput;
 import com.pawtrail.auth.presentation.request.validation.MaxBytes;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -22,13 +23,13 @@ public record PasswordChangeRequest(
         @NotBlank(message = "현재 비밀번호를 입력해 주세요")
         String currentPassword,
 
-        // 새 비밀번호에만 길이 규칙을 붙입니다.
+        // 새 비밀번호에만 길이 규칙을 붙임
         //
-        // 현재 비밀번호는 이미 저장된 값과 대조만 하므로 형식을 볼 이유가 없습니다.
+        // 현재 비밀번호는 이미 저장된 값과 대조만 하므로 형식을 볼 이유가 없음
         // 규칙이 바뀌기 전에 만든 비밀번호를 쓰는 사람이 여기서 막히면
         // 비밀번호를 바꾸려는데 옛 비밀번호가 형식에 맞지 않아 못 바꾸는 상태가 됩니다.
         //
-        // @Size 와 @MaxBytes 를 함께 붙이는 이유는 세는 단위가 다르기 때문입니다.
+        // @Size 와 @MaxBytes 를 함께 붙이는 이유는 세는 단위가 다르기 때문임
         // @Size 는 글자 수를 세는데 BCrypt 는 72바이트를 넘는 입력을 거부하고,
         // 한글은 한 글자가 세 자리라 25자만 넘어도 걸립니다.
         // 바이트 검증이 없으면 형식 검증을 통과한 요청이 해싱에서 터져 500 이 나갑니다.
@@ -37,4 +38,14 @@ public record PasswordChangeRequest(
         @MaxBytes(value = 72, message = "비밀번호가 너무 깁니다. 한글은 한 글자가 세 자리로 계산됩니다")
         String newPassword
 ) {
+
+    /**
+     * 서비스가 받는 형태로 바꿉니다.
+     *
+     * 계정 식별자는 담지 않습니다. 그 값은 게이트웨이가 넣어 준 헤더에서 오므로
+     * 컨트롤러가 따로 넘깁니다.
+     */
+    public PasswordChangeInput toInput() {
+        return new PasswordChangeInput(currentPassword, newPassword);
+    }
 }

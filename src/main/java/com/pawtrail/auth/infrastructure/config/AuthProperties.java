@@ -46,16 +46,16 @@ public record AuthProperties(List<String> permitAll,
                     "app.auth.cookie 가 비어 있습니다. config 저장소의 auth-service.yml 을 확인하십시오");
         }
 
-        // 유예 시간이 없으면 기동을 막습니다.
+        // 유예 시간이 없으면 기동을 막음
         //
         // 이 값이 없으면 교체된 토큰이 곧바로 복제로 판정됩니다.
         // 탭 두 개가 동시에 갱신하거나 응답을 못 받고 재시도하는 흔한 상황에서
         // 정상 사용자가 모든 기기에서 로그아웃되며, 증상이 "가끔 로그아웃된다" 로만
-        // 나타나 원인을 짚기 어렵습니다.
+        // 나타나 원인을 짚기 어려움
         //
-        // 0 을 허용하지 않는 것도 같은 이유입니다.
+        // 0 을 허용하지 않는 것도 같은 이유임
         // 유예를 끄고 싶다는 뜻일 수도 있으나, 그 선택은 위 증상을 감수하겠다는 것이므로
-        // 설정에 빈 값을 두어 조용히 그렇게 되는 일이 없어야 합니다.
+        // 설정에 빈 값을 두어 조용히 그렇게 되는 일이 없어야 함
         if (rotationGrace == null || rotationGrace.isZero() || rotationGrace.isNegative()) {
             throw new IllegalStateException(
                     "app.auth.rotation-grace 가 없거나 0 입니다. "

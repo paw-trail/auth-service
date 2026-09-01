@@ -1,6 +1,6 @@
-package com.pawtrail.auth.presentation;
+package com.pawtrail.auth.presentation.controller;
 
-import com.pawtrail.auth.application.dto.response.OutboxMessageResponse;
+import com.pawtrail.auth.application.dto.output.OutboxMessageOutput;
 import com.pawtrail.auth.application.service.AdminOutboxService;
 import com.pawtrail.common.response.CommonApiResponse;
 import com.pawtrail.common.response.PageResponse;
@@ -51,10 +51,10 @@ public class AdminAccountController {
      * 비어 있다면 손댈 것이 없다는 뜻입니다.
      */
     @GetMapping("/outbox")
-    public ResponseEntity<CommonApiResponse<PageResponse<OutboxMessageResponse>>> findGivenUpOutbox(
+    public ResponseEntity<CommonApiResponse<PageResponse<OutboxMessageOutput>>> findGivenUpOutbox(
             @PageableDefault(size = 20) Pageable pageable) {
 
-        PageResponse<OutboxMessageResponse> response = adminOutboxService.findGivenUp(pageable);
+        PageResponse<OutboxMessageOutput> response = adminOutboxService.findGivenUp(pageable);
         return ResponseEntity.ok(CommonApiResponse.success(response));
     }
 

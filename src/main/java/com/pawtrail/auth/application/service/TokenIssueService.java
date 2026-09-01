@@ -1,5 +1,6 @@
 package com.pawtrail.auth.application.service;
 
+import com.pawtrail.auth.application.dto.input.ClientInfo;
 import com.pawtrail.auth.application.support.AfterCommitExecutor;
 import com.pawtrail.auth.domain.model.Account;
 import com.pawtrail.auth.domain.model.RefreshTokenLog;
@@ -57,12 +58,11 @@ public class TokenIssueService {
      * 저장소 쓰기를 커밋 뒤로 미루려면 진행 중인 트랜잭션이 있어야 하기 때문입니다.
      * 없이 부르면 즉시 예외가 나므로 빠뜨려도 조용히 지나가지 않습니다.
      *
-     * @param account   확인이 끝난 계정입니다. 로그인할 수 있는 상태인지는 부르는 쪽이 봅니다.
-     * @param ipAddress null 을 허용합니다. 무엇을 넣을지는 아직 정해지지 않았습니다.
-     * @param userAgent 브라우저가 보낸 값이며 게이트웨이가 지우지 않으므로 그대로 도착합니다.
+     * @param account 확인이 끝난 계정입니다. 로그인할 수 있는 상태인지는 부르는 쪽이 봅니다.
+     * @param client  발급 이력에 남길 접속 정보입니다.
      */
     @Transactional(propagation = Propagation.MANDATORY)
-    public IssuedSession issue(Account account, String ipAddress, String userAgent) {
+    public IssuedSession issue(Account account, ClientInfo client) {
         TokenProvider.IssuedToken accessToken =
                 tokenProvider.issueAccessToken(account.getId(), account.getRole());
         TokenProvider.IssuedToken refreshToken =
@@ -100,8 +100,8 @@ public class TokenIssueService {
                 refreshToken.tokenId(),
                 toLocalDateTime(Instant.now()),
                 toLocalDateTime(refreshToken.expiresAt()),
-                ipAddress,
-                userAgent));
+                client.ipAddress(),
+                client.userAgent()));
 
         account.updateLastLoginAt(LocalDateTime.now());
 

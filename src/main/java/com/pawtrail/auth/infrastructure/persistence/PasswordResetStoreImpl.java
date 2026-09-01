@@ -39,7 +39,7 @@ public class PasswordResetStoreImpl implements PasswordResetStore {
     public int increaseAttempt(String email) {
         Long count = redisTemplate.opsForValue().increment(attemptKey(email));
 
-        // 키가 처음 만들어질 때 수명을 붙입니다. 이유는 가입 인증 쪽과 같습니다.
+        // 키가 처음 만들어질 때 수명을 붙임. 이유는 가입 인증 쪽과 같음
         if (count != null && count == 1L) {
             redisTemplate.expire(attemptKey(email), CODE_TTL);
         }

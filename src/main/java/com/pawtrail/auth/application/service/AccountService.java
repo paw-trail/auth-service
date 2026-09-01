@@ -1,6 +1,7 @@
 package com.pawtrail.auth.application.service;
 
-import com.pawtrail.auth.application.dto.response.AccountResponse;
+import com.pawtrail.auth.application.dto.input.PasswordChangeInput;
+import com.pawtrail.auth.application.dto.output.AccountOutput;
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.model.Account;
 import com.pawtrail.auth.domain.repository.AccountRepository;
@@ -61,7 +62,7 @@ public class AccountService {
      * 그 필드는 로그인 응답에서 언제나 같은 값만 나가는 자리가 됩니다.
      */
     @Transactional(readOnly = true)
-    public AccountResponse getMyAccount(UUID accountId) {
+    public AccountOutput getMyAccount(UUID accountId) {
 
         Account account = accountRepository.findById(accountId)
             .orElseThrow(() -> {
@@ -85,7 +86,7 @@ public class AccountService {
         //
         // 로그인 응답이 이 형태를 함께 쓰는 것도 이유임
         // 로그인은 탈퇴한 계정을 이미 막으므로 거기서는 언제나 같은 값만 나감
-        return AccountResponse.from(account);
+        return AccountOutput.from(account);
     }
 
     /**
@@ -104,7 +105,7 @@ public class AccountService {
      * 쿠키를 지우는 일은 컨트롤러가 합니다. 그것이 HTTP 의 사정이기 때문입니다.
      */
     @Transactional
-    public void changePassword(UUID accountId, String currentRawPassword, String newRawPassword) {
+    public void changePassword(UUID accountId, PasswordChangeInput input) {
 
         Account account = accountRepository.findById(accountId)
             .orElseThrow(() -> {
@@ -136,11 +137,11 @@ public class AccountService {
         //
         // 로그인과 달리 계정을 숨길 이유가 없어 사유를 그대로 알려 줌
         // 이미 그 계정으로 들어와 있는 사람이라 새로 드러나는 사실이 없음
-        if (!passwordEncoder.matches(currentRawPassword, account.getPasswordHash())) {
+        if (!passwordEncoder.matches(input.currentPassword(), account.getPasswordHash())) {
             throw new CustomException(AuthErrorCode.CURRENT_PASSWORD_MISMATCH);
         }
 
-        account.changePassword(passwordEncoder.encode(newRawPassword));
+        account.changePassword(passwordEncoder.encode(input.newPassword()));
 
         // 이전에 발급된 토큰을 전부 무효로 만듦
         //

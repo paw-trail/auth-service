@@ -1,4 +1,4 @@
-package com.pawtrail.auth.infrastructure.provider;
+package com.pawtrail.auth.infrastructure.provider.external;
 
 import com.pawtrail.auth.domain.exception.AuthErrorCode;
 import com.pawtrail.auth.domain.provider.MailSender;
@@ -28,9 +28,9 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class SmtpMailSender implements MailSender {
 
-    // 로고 화면에서 뽑은 색입니다.
+    // 로고 화면에서 뽑은 색임
     //
-    // 설정이 아니라 상수로 두는 것은, 이 값이 환경에 따라 달라지지 않기 때문입니다.
+    // 설정이 아니라 상수로 두는 것은, 이 값이 환경에 따라 달라지지 않기 때문임
     // 프론트가 정한 값과 어긋나면 여기를 고칩니다.
     private static final String CREAM = "#EDE6DB";
     private static final String GREEN = "#6E9370";
@@ -50,25 +50,25 @@ public class SmtpMailSender implements MailSender {
         try {
             MimeMessage message = javaMailSender.createMimeMessage();
 
-            // true 는 첨부를 붙일 수 있는 형태로 만든다는 뜻입니다.
-            // 지금은 첨부가 없지만 한글이 깨지지 않게 인코딩을 지정하려면 이 생성자를 써야 합니다.
+            // true 는 첨부를 붙일 수 있는 형태로 만든다는 뜻임
+            // 지금은 첨부가 없지만 한글이 깨지지 않게 인코딩을 지정하려면 이 생성자를 써야 함
             MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
 
-            // 보내는 사람 이름을 함께 지정합니다.
-            // 이 값이 받는 쪽 메일함 목록에 그대로 보이므로, 계정 주소만 뜨는 것보다 낫습니다.
+            // 보내는 사람 이름을 함께 지정함
+            // 이 값이 받는 쪽 메일함 목록에 그대로 보이므로, 계정 주소만 뜨는 것보다 나음
             helper.setFrom(mailProperties.from(), SERVICE_NAME);
             helper.setTo(to);
             helper.setSubject("[" + SERVICE_NAME + "] " + purpose.subject());
 
             // 두 번째 인자가 true 라야 HTML 로 해석됩니다.
-            // 빠뜨리면 태그가 그대로 글자로 보입니다.
+            // 빠뜨리면 태그가 그대로 글자로 보임
             helper.setText(buildHtml(code, purpose), true);
 
             javaMailSender.send(message);
             log.info("인증 메일을 보냈습니다. purpose={}", purpose);
 
         } catch (Exception e) {
-            // 받는 주소는 남기지 않습니다. 로그에 이메일이 쌓이는 것을 피합니다.
+            // 받는 주소는 남기지 않음. 로그에 이메일이 쌓이는 것을 피함
             log.error("인증 메일 발송에 실패했습니다. purpose={}", purpose, e);
             throw new CustomException(AuthErrorCode.MAIL_SEND_FAILED, e);
         }

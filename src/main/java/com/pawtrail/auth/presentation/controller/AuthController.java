@@ -1,6 +1,7 @@
-package com.pawtrail.auth.presentation;
+package com.pawtrail.auth.presentation.controller;
 
-import com.pawtrail.auth.application.dto.response.AccountResponse;
+import com.pawtrail.auth.application.dto.output.AccountOutput;
+import com.pawtrail.auth.presentation.support.ClientInfoFactory;
 import com.pawtrail.auth.application.service.AccountService;
 import com.pawtrail.auth.application.service.AuthService;
 import com.pawtrail.auth.application.service.EmailVerificationService;
@@ -68,11 +69,10 @@ public class AuthController {
      * 그것으로 한 번 들어와 보는 편이 낫다고 보았습니다.
      */
     @PostMapping("/signup")
-    public ResponseEntity<CommonApiResponse<AccountResponse>> signup(
+    public ResponseEntity<CommonApiResponse<AccountOutput>> signup(
             @Valid @RequestBody SignupRequest request) {
 
-        AccountResponse response = authService.signup(
-                request.email(), request.password(), request.nickname());
+        AccountOutput response = authService.signup(request.toInput());
 
         return ResponseEntity
                 .status(HttpStatus.CREATED)
@@ -87,39 +87,34 @@ public class AuthController {
      * 그래서 프론트는 로그인 여부를 GET /auth/me 로만 알 수 있습니다.
      */
     @PostMapping("/login")
-    public ResponseEntity<CommonApiResponse<AccountResponse>> login(
+    public ResponseEntity<CommonApiResponse<AccountOutput>> login(
             @Valid @RequestBody LoginRequest request,
             HttpServletRequest servletRequest) {
 
-        // 어떤 주소에서 왔는지를 확인하기 위한 로그입니다.
+        // 어떤 주소에서 왔는지를 확인하기 위한 로그임
         //
         // 앞에 게이트웨이가 있어 getRemoteAddr 은 게이트웨이 주소를 돌려줍니다.
         // 원래 주소는 X-Forwarded-For 헤더에 실려 오는데, 그것이 실제로 도착하는지를
-        // 아직 확인하지 못했습니다. 받는 쪽이 있어야 보이는 값이기 때문입니다.
+        // 아직 확인하지 못했음. 받는 쪽이 있어야 보이는 값이기 때문임
         //
-        // 확인이 끝나면 이 로그를 지우고 refresh_token_log 의 ip_address 를 채우는 방식을 정합니다.
+        // 확인이 끝나면 이 로그를 지우고 refresh_token_log 의 ip_address 를 채우는 방식을 정함
         log.info("로그인 요청 X-Forwarded-For={}, User-Agent={}, remoteAddr={}",
                 servletRequest.getHeader("X-Forwarded-For"),
                 servletRequest.getHeader(HttpHeaders.USER_AGENT),
                 servletRequest.getRemoteAddr());
 
         AuthService.LoginResult result = authService.login(
-                request.email(),
-                request.password(),
-                // 지금은 넣지 않습니다. 위 로그로 무엇을 넣을지 정한 뒤에 채웁니다.
-                // 컬럼이 비어도 되게 해 두었으므로 그때까지 null 로 둡니다.
-                null,
-                servletRequest.getHeader(HttpHeaders.USER_AGENT));
+                request.toInput(ClientInfoFactory.from(servletRequest)));
 
         ResponseCookie accessCookie = cookieFactory.accessToken(
                 result.accessToken().value(), result.accessToken().expiresAt());
         ResponseCookie refreshCookie = cookieFactory.refreshToken(
                 result.refreshToken().value(), result.refreshToken().expiresAt());
 
-        // 쿠키 두 개를 각각 헤더로 붙입니다.
+        // 쿠키 두 개를 각각 헤더로 붙임
         //
         // Set-Cookie 는 하나의 헤더에 여러 값을 담을 수 없어 줄이 두 개가 됩니다.
-        // add 를 두 번 부르는 것이 그 때문이며 set 을 쓰면 뒤엣것이 앞을 덮습니다.
+        // add 를 두 번 부르는 것이 그 때문이며 set 을 쓰면 뒤엣것이 앞을 덮음
         return ResponseEntity
                 .ok()
                 .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
@@ -145,11 +140,7 @@ public class AuthController {
             HttpServletRequest servletRequest) {
 
         RefreshService.RefreshResult result = refreshService.refresh(
-                refreshTokenValue,
-                // 로그인과 같은 이유로 아직 비워 둡니다.
-                // X-Forwarded-For 를 무엇으로 읽을지 정해지면 그때 함께 채웁니다.
-                null,
-                servletRequest.getHeader(HttpHeaders.USER_AGENT));
+                refreshTokenValue, ClientInfoFactory.from(servletRequest));
 
         ResponseCookie accessCookie = cookieFactory.accessToken(
                 result.accessToken(), result.accessExpiresAt());
@@ -203,10 +194,10 @@ public class AuthController {
      * 프론트가 두 자리에서 같은 모양을 다루면 되고, 로그인 직후에 이것을 또 부를 필요도 없습니다.
      */
     @GetMapping("/me")
-    public ResponseEntity<CommonApiResponse<AccountResponse>> getMyAccount(
+    public ResponseEntity<CommonApiResponse<AccountOutput>> getMyAccount(
             @CurrentUser CustomUserPrincipal principal) {
 
-        AccountResponse response = accountService.getMyAccount(principal.accountId());
+        AccountOutput response = accountService.getMyAccount(principal.accountId());
         return ResponseEntity.ok(CommonApiResponse.success(response));
     }
 
@@ -229,8 +220,7 @@ public class AuthController {
             @CurrentUser CustomUserPrincipal principal,
             @Valid @RequestBody PasswordChangeRequest request) {
 
-        accountService.changePassword(
-                principal.accountId(), request.currentPassword(), request.newPassword());
+        accountService.changePassword(principal.accountId(), request.toInput());
 
         return ResponseEntity
                 .ok()
@@ -310,7 +300,7 @@ public class AuthController {
     public ResponseEntity<CommonApiResponse<Void>> verifySignupCode(
             @Valid @RequestBody EmailVerificationRequest.VerifyCode request) {
 
-        emailVerificationService.verify(request.email(), request.code());
+        emailVerificationService.verify(request.toInput());
         return ResponseEntity.ok(CommonApiResponse.success(null));
     }
 
@@ -340,7 +330,7 @@ public class AuthController {
     public ResponseEntity<CommonApiResponse<Void>> resetPassword(
             @Valid @RequestBody EmailVerificationRequest.ResetPassword request) {
 
-        passwordResetService.reset(request.email(), request.code(), request.newPassword());
+        passwordResetService.reset(request.toInput());
         return ResponseEntity.ok(CommonApiResponse.success(null));
     }
 }

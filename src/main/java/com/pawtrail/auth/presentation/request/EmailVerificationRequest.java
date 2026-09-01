@@ -1,5 +1,7 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.application.dto.input.EmailVerifyInput;
+import com.pawtrail.auth.application.dto.input.PasswordResetInput;
 import com.pawtrail.auth.presentation.request.validation.MaxBytes;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -38,14 +40,18 @@ public final class EmailVerificationRequest {
             @Email(message = "이메일 형식이 올바르지 않습니다")
             String email,
 
-            // 여섯 자리 숫자만 받습니다.
+            // 여섯 자리 숫자만 받음
             //
-            // 형식이 틀린 것을 여기서 걸러도 계정 정보가 새지 않습니다.
-            // 어떤 이메일이 가입돼 있는지와 무관한 검사이기 때문입니다.
+            // 형식이 틀린 것을 여기서 걸러도 계정 정보가 새지 않음
+            // 어떤 이메일이 가입돼 있는지와 무관한 검사이기 때문임
             @NotBlank(message = "인증 코드를 입력해 주세요")
             @Pattern(regexp = "\\d{6}", message = "인증 코드는 6자리 숫자입니다")
             String code
     ) {
+
+        public EmailVerifyInput toInput() {
+            return new EmailVerifyInput(email, code);
+        }
     }
 
     /**
@@ -79,11 +85,15 @@ public final class EmailVerificationRequest {
             @Pattern(regexp = "\\d{6}", message = "인증 코드는 6자리 숫자입니다")
             String code,
 
-            // 가입 때와 같은 규칙입니다. 근거는 SignupRequest 에 적어 두었습니다.
+            // 가입 때와 같은 규칙임. 근거는 SignupRequest 에 적어 두었음
             @NotBlank(message = "새 비밀번호를 입력해 주세요")
             @Size(min = 8, max = 72, message = "비밀번호는 8자 이상 72자 이하여야 합니다")
             @MaxBytes(value = 72, message = "비밀번호가 너무 깁니다. 한글은 한 글자가 세 자리로 계산됩니다")
             String newPassword
     ) {
+
+        public PasswordResetInput toInput() {
+            return new PasswordResetInput(email, code, newPassword);
+        }
     }
 }

@@ -73,8 +73,8 @@ public class TokenProvider {
         Instant now = Instant.now();
         Instant expiresAt = now.plusSeconds(expirySeconds);
 
-        // jti 는 우리가 만들어 넣습니다.
-        // 라이브러리가 자동으로 채워 주지 않고, 무엇보다 그 값을 밖에서 알아야 합니다.
+        // jti 는 우리가 만들어 넣음
+        // 라이브러리가 자동으로 채워 주지 않고, 무엇보다 그 값을 밖에서 알아야 함
         String tokenId = UUID.randomUUID().toString();
 
         JwtClaimsSet claims = JwtClaimsSet.builder()
@@ -82,21 +82,21 @@ public class TokenProvider {
                 .issuedAt(now)
                 .expiresAt(expiresAt)
                 .id(tokenId)
-                // 아래 두 이름은 게이트웨이 설정과 같아야 합니다.
+                // 아래 두 이름은 게이트웨이 설정과 같아야 함
                 // claim(name, value) 로 넣으므로 sub 도 같은 방식으로 처리됩니다.
                 .claim(jwtProperties.claim().accountId(), accountId.toString())
                 .claim(jwtProperties.claim().role(), role.name())
-                // 토큰의 종류입니다.
+                // 토큰의 종류임
                 //
-                // 게이트웨이는 access 만 통과시키고 갱신과 로그아웃은 refresh 만 받습니다.
-                // 이 값이 없던 때에는 둘을 바꿔 쓸 수 있었고 그것이 두 방향으로 샜습니다.
+                // 게이트웨이는 access 만 통과시키고 갱신과 로그아웃은 refresh 만 받음
+                // 이 값이 없던 때에는 둘을 바꿔 쓸 수 있었고 그것이 두 방향으로 샜음
                 .claim(jwtProperties.claim().type(), type.value())
                 .build();
 
-        // 알고리즘을 헤더에 명시합니다.
+        // 알고리즘을 헤더에 명시함
         //
         // 지정하지 않으면 라이브러리가 키에서 추론하는데,
-        // 우리는 검증 쪽이 RS256 만 받도록 고정해 두었으므로 발급도 명시해 짝을 분명히 합니다.
+        // 우리는 검증 쪽이 RS256 만 받도록 고정해 두었으므로 발급도 명시해 짝을 분명히 함
         JwsHeader header = JwsHeader.with(SignatureAlgorithm.RS256).build();
 
         String value = jwtEncoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
