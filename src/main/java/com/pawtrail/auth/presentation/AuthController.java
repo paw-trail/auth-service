@@ -7,6 +7,7 @@ import com.pawtrail.auth.application.service.EmailVerificationService;
 import com.pawtrail.auth.application.service.LogoutService;
 import com.pawtrail.auth.application.service.PasswordResetService;
 import com.pawtrail.auth.application.service.RefreshService;
+import com.pawtrail.auth.application.service.WithdrawService;
 import com.pawtrail.auth.infrastructure.security.CookieFactory;
 import com.pawtrail.auth.presentation.request.EmailVerificationRequest;
 import com.pawtrail.auth.presentation.request.LoginRequest;
@@ -24,6 +25,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CookieValue;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -55,6 +57,7 @@ public class AuthController {
     private final LogoutService logoutService;
     private final EmailVerificationService emailVerificationService;
     private final PasswordResetService passwordResetService;
+    private final WithdrawService withdrawService;
     private final CookieFactory cookieFactory;
 
     /**
@@ -228,6 +231,52 @@ public class AuthController {
 
         accountService.changePassword(
                 principal.accountId(), request.currentPassword(), request.newPassword());
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireAccessToken().toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireRefreshToken().toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 탈퇴 인증 코드를 보냅니다.
+     *
+     * 이 경로는 인증이 필요합니다. permit-all 목록에 넣지 않습니다.
+     * 가입 인증과 비밀번호 재설정은 토큰을 받기 전에 부르는 요청이라 열어 두었지만,
+     * 탈퇴는 이미 로그인한 사람이 자기 계정에 하는 일입니다.
+     *
+     * 이메일을 받지 않습니다. 게이트웨이가 넣어 준 식별자로 계정을 찾아
+     * 거기 등록된 주소로 보냅니다.
+     */
+    @PostMapping("/withdraw/verify-request")
+    public ResponseEntity<CommonApiResponse<Void>> sendWithdrawCode(
+            @CurrentUser CustomUserPrincipal principal) {
+
+        withdrawService.sendCode(principal.accountId());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 탈퇴합니다.
+     *
+     * 본인 확인을 메일 코드로 합니다.
+     * 비밀번호로 하면 소셜 계정은 확인할 수단이 없어 계정 종류에 따라
+     * 보호 수준이 갈리는데, 이메일은 어느 쪽이든 반드시 있습니다.
+     *
+     * 성공하면 쿠키를 지웁니다.
+     * 발급된 토큰이 전부 무효가 되므로 남겨 두면 브라우저에 쓸 수 없는 쿠키가 남고,
+     * 사용자는 다음 요청이 거부될 때가 되어서야 상태를 알게 됩니다.
+     *
+     * 계정 행은 남지만 이메일과 제공자 식별자가 끊기므로 같은 주소로 다시 가입할 수 있습니다.
+     * 다만 새 계정이며 옛 데이터는 돌아오지 않습니다.
+     */
+    @DeleteMapping("/me")
+    public ResponseEntity<CommonApiResponse<Void>> withdraw(
+            @CurrentUser CustomUserPrincipal principal,
+            @Valid @RequestBody EmailVerificationRequest.Withdraw request) {
+
+        withdrawService.withdraw(principal.accountId(), request.code());
 
         return ResponseEntity
                 .ok()

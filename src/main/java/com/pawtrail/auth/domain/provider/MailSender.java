@@ -12,7 +12,7 @@ public interface MailSender {
     /**
      * 인증 코드 메일을 보냅니다.
      *
-     * 두 기능이 같은 메서드를 씁니다. 제목과 안내 문구만 다릅니다.
+     * 여러 기능이 같은 메서드를 씁니다. 제목과 안내 문구만 다릅니다.
      *
      * @param purpose 무엇을 위한 코드인지입니다. 제목과 본문 첫 줄에 쓰입니다.
      * @throws com.pawtrail.common.exception.CustomException 발송에 실패한 경우입니다.
@@ -29,7 +29,8 @@ public interface MailSender {
     enum MailPurpose {
 
         SIGNUP("이메일 인증", "이메일 인증을 완료해 주세요."),
-        PASSWORD_RESET("비밀번호 재설정", "비밀번호를 재설정하려면 아래 코드를 입력해 주세요.");
+        PASSWORD_RESET("비밀번호 재설정", "비밀번호를 재설정하려면 아래 코드를 입력해 주세요."),
+        WITHDRAW("회원 탈퇴", "탈퇴를 진행하려면 아래 코드를 입력해 주세요.");
 
         private final String subject;
         private final String message;
