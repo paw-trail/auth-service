@@ -85,12 +85,25 @@ app:
     claim:
       account-id: sub
       role: role
+      # 토큰의 종류를 담는 이름임
+      #
+      # 액세스와 리프레시가 담는 내용이 같고 수명만 달라 이 값으로 구분함
+      # config 저장소 auth-service.yml 및 게이트웨이와 같은 값이어야 함
+      # 없으면 JwtProperties 검증에 걸려 contextLoads 가 실패함
+      type: typ
 
   auth:
     # 실제 목록과 같을 필요는 없음
     # 비어 있지만 않으면 되고, 경로 규칙이 맞는지는 이 테스트가 볼 수 있는 것이 아님
     permit-all:
       - /api/v1/auth/login
+
+    # 리프레시 토큰을 교체한 뒤 옛 토큰을 살려 두는 시간임
+    #
+    # AuthProperties 가 값이 없거나 0 이면 기동을 막게 되어 있어 채움
+    # 실제 값과 같을 필요는 없으나 맞춰 두면 헷갈리지 않음
+    rotation-grace: 30s
+
     cookie:
       secure: false
       domain: ""

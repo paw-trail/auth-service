@@ -12,11 +12,16 @@ import lombok.NoArgsConstructor;
 import org.hibernate.annotations.UuidGenerator;
 
 /**
- * 리프레시 토큰 발급 이력입니다. 토큰 자체는 여기에 없습니다.
+ * 리프레시 토큰 발급·회수 이력입니다. 토큰 자체는 여기에 없습니다.
  *
  * 실제 토큰은 Redis 의 refresh:{jti} 에 있습니다.
  * 로그아웃할 때 즉시 무효화해야 하는데 데이터베이스로는 만료까지 기다려야 하기 때문입니다.
- * 이 엔티티는 "언제 어디서 발급됐는가" 만 남겨 장애 조사와 이상 접속 확인에 씁니다.
+ * 이 엔티티는 "언제 어디서 발급됐고 언제 회수됐는가" 만 남겨
+ * 장애 조사와 이상 접속 확인에 씁니다.
+ *
+ * 갱신할 때마다 행이 하나씩 늘어납니다.
+ * 리프레시 토큰을 함께 새로 발급하므로 옛 토큰의 이력을 덮어쓰지 않고 회수 시각만 남깁니다.
+ * 한 번의 로그인이 여러 행으로 흩어지는데 그 행들은 loginId 로 묶입니다.
  *
  * BaseEntity 를 상속하지 않습니다.
  * createdAt 이 issuedAt 과, deletedAt 이 revokedAt 과 같은 값이 되어
@@ -43,6 +48,32 @@ public class RefreshTokenLog {
     @Column(name = "account_id", nullable = false, updatable = false)
     private UUID accountId;
 
+    // 로그인 한 번을 묶는 값임
+    //
+    // 로그인할 때 만들고 갱신할 때 그대로 물려줌
+    // 이 값이 없으면 기기가 둘 이상일 때 어느 행이 어느 로그인에서 시작됐는지 알 수 없음
+    //
+    //   행  loginId  issuedAt  revokedAt
+    //   X   A        09:00     09:30      <- 폰으로 로그인
+    //   Y   A        09:30      10:00
+    //   Z   A        10:00     null       <- 폰의 현재 토큰
+    //   P   B        14:00     14:30      <- PC 로 로그인
+    //   Q   B        14:30     null       <- PC 의 현재 토큰
+    //
+    // 마지막 행의 issuedAt 은 로그인 시각이 아니라 마지막 갱신 시각임
+    // 로그인 시각은 그 사슬의 첫 행에 있음
+    //
+    // 인증 판단에는 쓰이지 않음
+    // 로그인, 갱신, 재사용 탐지, 토큰 폐기 어디에서도 이 값을 보지 않으며
+    // 쓰기만 하고 읽는 것은 사람이 이 표를 볼 때뿐임
+    // 성격이 Zipkin 의 traceId 에 가까움
+    //
+    // 이름을 sessionId 로 두지 않은 것은 의도임
+    // 서버 세션을 도입했다는 뜻으로 읽히나 이 서비스는 여전히 토큰 기반이며
+    // 이 값은 로그를 묶는 것 외에 하는 일이 없음
+    @Column(name = "login_id", nullable = false, updatable = false)
+    private UUID loginId;
+
     // JWT 의 jti 임
     // Redis 키 refresh:{jti} 와 같은 값이며 이 값으로 이력과 실제 토큰이 이어짐
     @Column(name = "token_id", nullable = false, updatable = false, length = 36)
@@ -54,8 +85,13 @@ public class RefreshTokenLog {
     @Column(name = "expires_at", nullable = false, updatable = false)
     private LocalDateTime expiresAt;
 
-    // 로그아웃이나 강제 만료로 회수된 시각임
+    // 회수된 시각임
     // null 이면 아직 유효함
+    //
+    // 채워지는 경로가 셋임
+    //   로그아웃    그 토큰 하나
+    //   갱신        교체된 옛 토큰
+    //   일괄 폐기    그 계정의 아직 유효한 토큰 전부
     @Column(name = "revoked_at")
     private LocalDateTime revokedAt;
 
@@ -75,10 +111,11 @@ public class RefreshTokenLog {
     @Column(name = "user_agent", columnDefinition = "text")
     private String userAgent;
 
-    private RefreshTokenLog(UUID accountId, String tokenId,
+    private RefreshTokenLog(UUID accountId, UUID loginId, String tokenId,
                             LocalDateTime issuedAt, LocalDateTime expiresAt,
                             String ipAddress, String userAgent) {
         this.accountId = accountId;
+        this.loginId = loginId;
         this.tokenId = tokenId;
         this.issuedAt = issuedAt;
         this.expiresAt = expiresAt;
@@ -89,17 +126,22 @@ public class RefreshTokenLog {
     /**
      * 발급 이력을 남깁니다.
      *
+     * 로그인할 때와 갱신할 때 모두 이것으로 만듭니다.
+     * 갱신이면 loginId 에 옛 행의 값을 그대로 넘겨 같은 사슬로 이어 줍니다.
+     *
+     * @param loginId  로그인 한 번을 묶는 값입니다. 로그인이면 새로 만들고, 갱신이면 물려받습니다.
      * @param tokenId  JWT 의 jti 이며 Redis 키와 같은 값입니다.
      * @param ipAddress null 을 허용합니다. 아직 무엇을 넣을지 정해지지 않았습니다.
      */
-    public static RefreshTokenLog issue(UUID accountId, String tokenId,
+    public static RefreshTokenLog issue(UUID accountId, UUID loginId, String tokenId,
                                         LocalDateTime issuedAt, LocalDateTime expiresAt,
                                         String ipAddress, String userAgent) {
-        return new RefreshTokenLog(accountId, tokenId, issuedAt, expiresAt, ipAddress, userAgent);
+        return new RefreshTokenLog(accountId, loginId, tokenId,
+                issuedAt, expiresAt, ipAddress, userAgent);
     }
 
     /**
-     * 회수 시각을 남깁니다. 로그아웃이나 강제 만료 때 부릅니다.
+     * 회수 시각을 남깁니다. 로그아웃, 갱신으로 교체될 때, 일괄 폐기 때 부릅니다.
      *
      * 이미 회수된 이력은 그대로 둡니다.
      * 같은 토큰으로 로그아웃이 두 번 들어와도 처음 시각이 유지되어야 하기 때문입니다.

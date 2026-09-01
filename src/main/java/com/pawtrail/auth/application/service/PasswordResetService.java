@@ -41,6 +41,7 @@ public class PasswordResetService {
     private final PasswordEncoder passwordEncoder;
     private final MailSender mailSender;
     private final AfterCommitExecutor afterCommitExecutor;
+    private final TokenRevokeService tokenRevokeService;
 
     /**
      * 재설정 코드를 보냅니다.
@@ -134,6 +135,21 @@ public class PasswordResetService {
             .orElseThrow(() -> new CustomException(AuthErrorCode.ACCOUNT_NOT_FOUND));
 
         account.changePassword(passwordEncoder.encode(newRawPassword));
+
+        // 이전에 발급된 토큰을 전부 무효로 만듭니다.
+        //
+        // 비밀번호를 바꾸는 이유가 대개 "누가 내 계정에 들어온 것 같다" 인데,
+        // 바꿔도 기존 세션이 살아 있으면 그 행위의 목적이 절반만 달성됩니다.
+        //
+        // 같은 트랜잭션에서 돌아야 합니다.
+        // 새 트랜잭션으로 하면 계정을 데이터베이스에서 다시 읽어 고치는데,
+        // 여기 있는 인스턴스가 나중에 갱신되면서 그 값을 옛것으로 덮습니다.
+        //
+        // 이미 나가 있는 액세스 토큰은 이것으로 막히지 않습니다.
+        // 게이트웨이가 서명만 보고 통과시키므로 만료될 때까지(30분) 그대로 쓰입니다.
+        // 그 시간을 없애려면 게이트웨이가 매 요청마다 폐기 목록을 조회해야 하는데,
+        // 그러면 액세스 토큰을 상태 없이 두기로 한 결정이 통째로 뒤집힙니다.
+        tokenRevokeService.revokeAll(account.getId(), "비밀번호 재설정");
 
         // 코드를 지웁니다. 한 번 쓰면 없어지는 값입니다.
         //

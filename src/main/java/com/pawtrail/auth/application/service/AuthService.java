@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.UUID;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -171,8 +172,19 @@ public class AuthService {
                 () -> refreshTokenStore.save(refreshToken.tokenId(), account.getId(), refreshTtl),
                 "리프레시 토큰 저장");
 
+        // 이 로그인 한 번을 묶는 값을 여기서 만듭니다.
+        //
+        // 갱신할 때마다 리프레시 토큰이 교체되면서 이력에 행이 하나씩 쌓이는데,
+        // 그 행들은 이 값을 그대로 물려받아 한 사슬이 됩니다.
+        // 없으면 기기가 둘 이상일 때 어느 행이 어느 로그인에서 시작됐는지 알 수 없고,
+        // 마지막 행의 발급 시각은 로그인 시각이 아니라 마지막 갱신 시각입니다.
+        //
+        // 인증 판단에는 쓰이지 않습니다. 이력을 사람이 읽을 때만 쓰는 값입니다.
+        UUID loginId = UUID.randomUUID();
+
         refreshTokenLogRepository.save(RefreshTokenLog.issue(
                 account.getId(),
+                loginId,
                 refreshToken.tokenId(),
                 toLocalDateTime(Instant.now()),
                 toLocalDateTime(refreshToken.expiresAt()),

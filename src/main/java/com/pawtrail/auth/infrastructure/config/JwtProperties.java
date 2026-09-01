@@ -44,6 +44,22 @@ public record JwtProperties(String privateKeyB64,
                     "app.jwt.access-expiry 와 refresh-expiry 가 필요합니다. "
                             + "config 저장소의 auth-service.yml 을 확인하십시오");
         }
+
+        // 수명이 0 이하이면 기동을 막습니다.
+        //
+        // 값이 0 이면 발급되자마자 만료된 토큰이 나가는데, 그것으로 갱신을 시도하면
+        // 저장소에 남길 수명도 0 이 되어 토큰 교체가 중간에 실패합니다.
+        // 그때 옛 토큰만 사라지고 새 토큰이 남지 않아, 이어지는 갱신이 복제로 판정되고
+        // 계정의 토큰이 전부 폐기됩니다. 오류가 나지 않아 설정 문제라는 것이 드러나지 않습니다.
+        //
+        // 값을 1초로 올려 주는 식으로 넘기지 않는 것은 의도입니다.
+        // 그러면 잘못된 설정이 조용히 굴러가고, 나중에 "왜 로그인이 금방 풀리지" 로만 나타납니다.
+        if (accessExpiry.isZero() || accessExpiry.isNegative()
+                || refreshExpiry.isZero() || refreshExpiry.isNegative()) {
+            throw new IllegalStateException(
+                    "app.jwt.access-expiry 와 refresh-expiry 는 0보다 커야 합니다. "
+                            + "access=" + accessExpiry + ", refresh=" + refreshExpiry);
+        }
         if (issuer == null || issuer.isBlank()) {
             throw new IllegalStateException(
                     "app.jwt.issuer 가 비어 있습니다. config 저장소의 auth-service.yml 을 확인하십시오");
@@ -62,8 +78,12 @@ public record JwtProperties(String privateKeyB64,
      *
      * @param accountId 사용자 식별자를 넣을 이름입니다. 표준 항목인 sub 를 씁니다.
      * @param role      권한을 넣을 이름입니다. 표준에 없어 우리가 정한 이름입니다.
+     * @param type      토큰의 종류를 넣을 이름입니다.
+     *                  * 액세스와 리프레시가 담는 내용이 같고 수명만 달라 이 값이 없으면 구분할 수 없습니다
+     *                    구분하지 않으면 리프레시 토큰을 액세스 쿠키에 넣어 오래 쓸 수 있고,
+     *                    액세스 토큰을 갱신 요청에 보내면 복제로 오인되어 계정이 통째로 잠깁니다
      */
-    public record ClaimNames(String accountId, String role) {
+    public record ClaimNames(String accountId, String role, String type) {
 
         /**
          * 두 이름이 비어 있으면 기동을 막습니다.
@@ -85,6 +105,11 @@ public record JwtProperties(String privateKeyB64,
                 throw new IllegalStateException(
                         "app.jwt.claim.role 이 비어 있습니다. "
                                 + "게이트웨이의 app.jwt.claim.role 과 같은 값이어야 합니다");
+            }
+            if (type == null || type.isBlank()) {
+                throw new IllegalStateException(
+                        "app.jwt.claim.type 이 비어 있습니다. "
+                                + "게이트웨이의 app.jwt.claim.type 과 같은 값이어야 합니다");
             }
         }
     }
