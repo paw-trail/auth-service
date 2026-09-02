@@ -32,7 +32,7 @@
 
 | | 개수 | 어디에 |
 |---|---|---|
-| API | **17개** | `/api/v1/auth/**` 15개 + `/api/v1/admin/accounts/**` 2개 |
+| API | **16개** | `/api/v1/auth/**` 14개 + `/api/v1/admin/accounts/**` 2개 |
 | 테이블 | 2개 + outbox | `account` · `refresh_token_log` |
 | Redis 키 종류 | 9종 | 리프레시 토큰 · 인증 코드 4종 · 발송 제한 2종 · OAuth · 시도 횟수 |
 | 발행하는 이벤트 | 2개 | `account.created` · `account.withdrawn` |
@@ -63,7 +63,7 @@
 |---|---|
 | 일단 띄워서 로그인이 되는지 보고 싶다 | [1장](#1-로컬에서-띄우기) |
 | 토큰이 뭔지, 쿠키가 왜 두 개인지 모르겠다 | [2장](#2-인증이-어떻게-도는가) |
-| API 를 부르려는데 요청·응답 형태를 모르겠다 | [3장](#3-api-17개) |
+| API 를 부르려는데 요청·응답 형태를 모르겠다 | [3장](#3-api-16개) |
 | 테이블·Redis 키·이벤트가 뭐가 있는지 | [4장](#4-데이터) |
 | 코드를 고치려는데 어느 파일인지 모르겠다 | [5장](#5-코드-구조) |
 | 설정값이 어디서 오는지 | [6장](#6-설정값) |
@@ -95,7 +95,7 @@
 #19  패키지 구조 정리                 ✅
 ```
 
-**API 17개가 전부 구현되고 실물 검증까지 끝났습니다.** 남은 것은
+**API 16개가 전부 구현되고 실물 검증까지 끝났습니다.** 남은 것은
 [10장](#10-아직-안-한-것) 에 있습니다.
 
 <br><br>
@@ -587,7 +587,7 @@ auth  ──▶  토큰  ──▶  게이트웨이     서명 확인 → sub ·
 
 ---
 
-## 3. API 17개
+## 3. API 16개
 
 전부 게이트웨이(`:8080`)를 거쳐 부릅니다. 응답은 공통 형식입니다.
 
@@ -620,8 +620,8 @@ auth  ──▶  토큰  ──▶  게이트웨이     서명 확인 → sub ·
 | 15 | GET | `/api/v1/admin/accounts/outbox` | **ADMIN** | 포기한 이벤트 목록 |
 | 16 | POST | `/api/v1/admin/accounts/outbox/{id}/retry` | **ADMIN** | 재발행 |
 
-> 15개가 아니라 16개인 이유 — `{provider}` 자리에 지금은 `google` 만 옵니다.
-> 표에서는 하나로 세었습니다.
+> `{provider}` 자리에 지금은 `google` 만 옵니다. 제공자가 늘어도 **경로가 이미
+> 변수로 되어 있어 게이트웨이와 라우트는 안 바뀝니다.**
 
 ---
 
@@ -1454,7 +1454,7 @@ com.pawtrail.auth
 │       └── ClientInfoFactory           HttpServletRequest 에서 IP · User-Agent 를 뽑음
 │
 ├── application/
-│   ├── service/                        ★11개 — 아래 5-2
+│   ├── service/                        *11개 — 아래 5-2
 │   ├── dto/
 │   │   ├── input/                      SignupInput · LoginInput · PasswordChangeInput · EmailVerifyInput
 │   │   │                               PasswordResetInput · OAuthCallbackInput · ClientInfo
@@ -1470,7 +1470,7 @@ com.pawtrail.auth
 │   ├── enums/
 │   │   ├── AuthProvider                LOCAL · GOOGLE  — hasPassword()
 │   │   └── AccountStatus               ACTIVE · WITHDRAWN
-│   ├── repository/                     ★8개 — 아래 5-3
+│   ├── repository/                     *8개 — 아래 5-3
 │   ├── provider/
 │   │   ├── MailSender                  메일을 보낸다는 약속 (MailPurpose 중첩)
 │   │   └── OAuthClient                 구글에서 사용자 정보를 가져온다는 약속
@@ -1482,19 +1482,19 @@ com.pawtrail.auth
 │
 └── infrastructure/
     ├── config/
-    │   ├── SecurityConfig              ★자기 보안 체인 — 아래 5-4
+    │   ├── SecurityConfig              *자기 보안 체인 — 아래 5-4
     │   ├── JwtEncoderConfig            RS256 키 → JwtEncoder · JwtDecoder. @ConfigurationProperties 등록도 여기
     │   ├── JwtProperties               app.jwt.*  — 비면 기동 실패
     │   ├── AuthProperties              app.auth.* — permit-all · 유예 · 쿠키
     │   ├── MailProperties              app.mail.*
     │   └── OAuthProperties             app.oauth.*
-    ├── security/                       ★auth 에만 있는 폴더 (템플릿에 없음)
+    ├── security/                       *auth 에만 있는 폴더 (템플릿에 없음)
     │   ├── TokenProvider               토큰 발급
     │   ├── TokenReader                 토큰 읽기 (갱신 · 로그아웃용)
     │   ├── TokenType                   ACCESS · REFRESH — typ 값
     │   └── CookieFactory               쿠키 만들기 · 지우기
     ├── persistence/
-    │   ├── *RepositoryImpl · *StoreImpl   ★8개 — 아래 5-3
+    │   ├── *RepositoryImpl · *StoreImpl   *8개 — 아래 5-3
     │   └── jpa/
     │       ├── AccountJpaRepository
     │       └── RefreshTokenLogJpaRepository
