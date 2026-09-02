@@ -1,2133 +1,2597 @@
-# 함께하개 서비스 템플릿
+# auth-service
 
-이 문서는 서비스 레포를 새로 만든 뒤 무엇을 어떻게 세팅하고, 각 폴더와 파일이 무슨 일을 하는지를 정리한 개발 지침입니다.
-
-**개발하는 동안 계속 참고합니다.** 구현이 끝나면 이 내용을 지우고 해당 서비스를 설명하는 README로 교체합니다.
-
-파일 이름 뒤의 괄호는 자바 타입을 뜻합니다. 자바에서는 클래스, 인터페이스, enum, record가 모두 `.java` 파일이라 이름만으로는 구분되지 않으므로 따로 표기했습니다.
+**함께하개의 인증 서비스입니다.** 계정을 만들고, 로그인시키고, 토큰을 발급합니다.
+도메인 서비스 14개 중 **첫 번째로 만들어진 서비스**이며, 다른 서비스들이 전부
+이 서비스가 만든 토큰을 전제로 동작합니다.
 
 ---
 
-## 0. 이 문서를 읽는 순서
+**먼저 전체 그림을 보고, 이 레포가 그 안 어디에 있는지 본 뒤 읽습니다.**
 
-문서가 길지만 처음부터 끝까지 읽을 필요는 없습니다. 지금 무엇을 하려는지에 따라 볼 곳이 다릅니다.
+**① 전체 구조 — 층으로 본 것.** 위에서 아래로 요청이 내려가고, 어느 층에 무엇이 있는지.
+
+![전체 구조 (층)](https://raw.githubusercontent.com/paw-trail/service-template/main/docs/architecture-layers.svg)
+
+**② 전체 구조 — 서비스끼리 무엇을 주고받는지.** 초록 실선이 `/internal` 호출, Kafka 표가 이벤트, 하늘색 점선이 VPC 경계.
+
+![전체 구조 (호출 관계)](https://raw.githubusercontent.com/paw-trail/service-template/main/docs/architecture.svg)
+
+**③ 이 레포를 중심으로.** 직접 연결된 것만 남긴 그림.
+
+![auth-service 를 중심으로](docs/focus-auth-service.svg)
+
+> ①② 는 `service-template/docs` 에 있는 것을 가리킵니다. 서비스가 늘어도 그쪽 한 곳만 고칩니다.
+
+<br><br>
+
+---
+
+## 본문 시작
+
+<br><br>
+
+---
+
+## 0. 이 서비스가 하는 일
+
+```
+브라우저  ──▶  게이트웨이  ──▶  auth
+                   │             │
+                   │             ├──▶  PostgreSQL  auth_db     계정 · 로그인 이력 · outbox
+                   │             ├──▶  Redis                  리프레시 토큰 · 인증 코드 · OAuth state
+                   │             ├──▶  Kafka                  account.created · account.withdrawn 발행
+                   │             ├──▶  Gmail SMTP             인증 코드 메일
+                   │             └──▶  Google OAuth           소셜 로그인
+                   │
+                   └──▶  쿠키의 JWT 를 검증하고 X-User-Id · X-User-Role 을 붙여 넘김
+                         auth 는 토큰을 만들고, 게이트웨이는 토큰을 확인함
+```
+
+> **auth 는 다른 도메인 서비스를 한 번도 부르지 않습니다.** 닉네임처럼 남의 데이터가
+> 필요한 것은 응답에 담지 않고, 프론트가 그 서비스를 따로 부릅니다.
+
+---
+
+**숫자로 보면 이렇습니다.**
+
+| | 개수 | 어디에 |
+|---|---|---|
+| API | **16개** | `/api/v1/auth/**` 14개 + `/api/v1/admin/accounts/**` 2개 |
+| 테이블 | 2개 + outbox | `account` · `refresh_token_log` |
+| Redis 키 종류 | 9종 | 리프레시 토큰 · 인증 코드 4종 · 발송 제한 2종 · OAuth · 시도 횟수 |
+| 발행하는 이벤트 | 2개 | `account.created` · `account.withdrawn` |
+| 받는 이벤트 | 0개 | 리스너가 없습니다 |
+| 부르는 바깥 시스템 | 2개 | Google OAuth · Gmail SMTP |
+| 서비스 클래스 | 11개 | [5-2](#5-2-서비스-클래스-11개--누가-무엇을-하나) |
+| 에러 코드 | 16개 | [3-9](#3-9-에러-코드-16개) |
+
+---
+
+**하는 일을 사용자 입장에서 보면 이렇습니다.**
+
+```
+가입          이메일 인증  →  회원가입  →  (user 서비스가 프로필을 만듦)
+로그인        이메일 + 비밀번호   또는   구글 계정
+로그인 유지    액세스 토큰 30분  →  만료되면 리프레시 토큰으로 갱신 (14일)
+비밀번호       변경 (로그인 상태)   /   재설정 (잊었을 때, 메일 인증)
+탈퇴          메일 인증  →  계정 상태를 바꾸고 다른 서비스에 알림
+```
+
+<br><br>
+
+---
+
+### 이 문서를 읽는 순서
 
 | 지금 하려는 일 | 볼 곳 |
 |---|---|
-| 방금 레포를 만들었고 코드를 처음 연다 | **1장** 을 순서대로 따라 합니다. 여기만 끝내면 빌드가 통과합니다 |
-| 로컬에서 서비스를 띄워보려 한다 | **2장**. 무엇을 Docker 로 띄우고 무엇을 IntelliJ 에서 실행하는지 나옵니다 |
-| 공통 모듈이 무엇인지 모르겠다 | **6장**. 무엇이 들어 있고 어떻게 쓰는지 코드 예시와 함께 있습니다 |
-| 코드를 어느 폴더에 둘지 모르겠다 | **5장**(왜 이렇게 나누는가) → **7장**(폴더마다 무엇을 두는가) |
-| 기동이 안 되거나 IntelliJ 가 빨간 줄을 긋는다 | **1-7**, **10장** |
-| DB 를 쓰지 않는 서비스를 맡았다 | **1-4** → **8장** |
+| 일단 띄워서 로그인이 되는지 보고 싶다 | [1장](#1-로컬에서-띄우기) |
+| 토큰이 뭔지, 쿠키가 왜 두 개인지 모르겠다 | [2장](#2-인증이-어떻게-도는가) |
+| API 를 부르려는데 요청·응답 형태를 모르겠다 | [3장](#3-api-16개) |
+| 테이블·Redis 키·이벤트가 뭐가 있는지 | [4장](#4-데이터) |
+| 코드를 고치려는데 어느 파일인지 모르겠다 | [5장](#5-코드-구조) |
+| 설정값이 어디서 오는지 | [6장](#6-설정값) |
+| 관리자를 지정하거나 이벤트를 다시 보내야 한다 | [7장](#7-운영) |
+| "왜 이렇게 만들었지" 가 궁금하다 | [8장](#8-왜-이렇게-만들었나) |
+| 뭔가 안 된다 | [9장](#9-막히기-쉬운-자리) |
+| 모르는 말이 나온다 | [11장](#11-용어) |
 
-**처음 읽는다면 1장 → 5장 → 6장 → 7장 순서를 권합니다.** 1장으로 환경을 만들고, 5장으로 왜 이렇게 나눴는지 이해한 뒤, 6장에서 공통으로 제공되는 것을 익히고, 7장에서 실제 파일을 어디에 만들지 확인하는 흐름입니다.
+> **공통 규칙은 이 문서에 없습니다.** 4계층 구조·공통 모듈·설정 저장소·Docker 환경은
+> [`service-template` README](https://github.com/paw-trail/service-template) 에 있고,
+> 이 문서는 **auth 에만 해당하는 것**을 적습니다.
 
-### 먼저 알아두면 좋은 것 3가지
-
-**① 서비스마다 DB 가 따로 있고, 남의 DB 에는 접속할 수 없습니다.** PostgreSQL 인스턴스는 하나지만 그 안에 서비스별 DB 와 전용 계정이 나뉘어 있습니다. 다른 서비스의 데이터가 필요하면 **그 서비스의 API 를 호출하거나 이벤트를 받습니다.**
-
-**② 인증은 게이트웨이가 끝냅니다.** 각 서비스는 JWT 를 직접 다루지 않습니다. 게이트웨이가 토큰을 검증한 뒤 `X-User-Id`·`X-User-Role` 헤더로 넣어주고, 공통 모듈의 필터가 그것을 읽어 `SecurityContext` 를 채웁니다. **게이트웨이는 헤더를 넣기 전에 바깥에서 들어온 같은 이름의 헤더를 먼저 지웁니다.** 그래야 이 헤더를 그대로 믿는 것이 성립합니다.
-
-**③ 이벤트는 카프카로 바로 보내지 않습니다.** 자기 DB 의 `outbox` 테이블에 먼저 저장하고, 커밋된 뒤에 별도 스레드가 발행합니다. "데이터는 저장됐는데 이벤트는 안 나갔다"를 막기 위한 구조이며, 공통 모듈이 전부 처리하므로 사용하는 쪽은 한 줄만 부르면 됩니다.
-
----
-
-## 기술 스택
-
-| 항목 | 버전 |
-|---|---|
-| Java | 21 |
-| Spring Boot | 4.1.1 |
-| Spring Cloud | 2025.1.3 (Oakwood) |
-| Gradle | 9.5.1 (래퍼로 고정) |
-| PostgreSQL | 17 + PostGIS 3.5 |
-| QueryDSL | io.github.openfeign.querydsl 7.6 |
-| springdoc-openapi | 3.1.0 |
-
-Spring Boot 3.x 계열은 2026년 6월 30일에 오픈소스 지원이 끝나 사용하지 않습니다.
-
-QueryDSL은 본가(`com.querydsl`)가 아니라 OpenFeign 포크를 사용합니다. **groupId만 다르고 패키지명은 `com.querydsl` 그대로**이므로 소스 코드는 일반적인 QueryDSL 예제와 동일하게 작성합니다.
+<br><br>
 
 ---
 
-## 1. 복제 후 최초 설정
+### 진행 상태
 
-TEMPLATE_REPO에서 "Use this template"으로 새 레포를 만든 뒤 한 번만 수행하는 절차입니다.
-
-### 1-1. 패키지 경로 치환은 IntelliJ를 열기 전에
-
-템플릿의 패키지 경로는 `com.pawtrail.template`입니다. 이것을 서비스명으로 바꿔야 하는데, IntelliJ로 프로젝트를 연 뒤에 바꾸면 프로젝트 구조 정보가 이전 이름으로 남아 모듈을 다시 인식시키는 작업이 따라붙습니다. **clone 직후 터미널에서 먼저 처리한 다음 IntelliJ를 여는 것이 가장 빠릅니다.**
-
-아래는 place 서비스를 만드는 예시입니다. 맨 위 값 두 개만 자기 도메인에 맞게 바꾸고, **레포 루트에서** 나머지를 그대로 실행합니다.
-
-운영체제마다 명령어가 다르므로 해당하는 것 하나만 실행합니다.
-
-#### macOS
-
-터미널에서 실행합니다. macOS에 기본 설치된 sed는 `-i` 뒤에 빈 인자를 하나 더 요구하므로 `sed -i ''` 형태입니다.
-
-```bash
-NEW=place        # 소문자 서비스명
-CLASS=Place      # 첫 글자만 대문자로 바꾼 것
-
-# 1) 패키지 폴더 이름 변경 (main, test 양쪽)
-mv src/main/java/com/pawtrail/template src/main/java/com/pawtrail/$NEW
-mv src/test/java/com/pawtrail/template src/test/java/com/pawtrail/$NEW
-
-# 2) 소스 안의 package 선언과 import 치환
-grep -rl "com.pawtrail.template" src | xargs sed -i '' "s/com\.pawtrail\.template/com.pawtrail.$NEW/g"
-
-# 3) 클래스 파일 이름 변경 (main, test 양쪽)
-mv src/main/java/com/pawtrail/$NEW/TemplateApplication.java \
-   src/main/java/com/pawtrail/$NEW/${CLASS}Application.java
-mv src/test/java/com/pawtrail/$NEW/TemplateApplicationTests.java \
-   src/test/java/com/pawtrail/$NEW/${CLASS}ApplicationTests.java
-
-# 4) 소스 안의 클래스명 치환
-grep -rl "TemplateApplication" src | xargs sed -i '' "s/TemplateApplication/${CLASS}Application/g"
+```
+#1   스키마 V20                      ✅
+#3   엔티티 + 리포지터리               ✅
+#5   인증 기반 — 보안 설정 · 토큰 발급  ✅
+#7   회원가입 · 로그인                 ✅
+#9   이메일 인증 · 비밀번호 재설정      ✅
+#11  refresh · logout               ✅
+#13  /me · 비밀번호 변경              ✅
+#15  소셜 로그인 (구글)               ✅
+#17  탈퇴 + 관리자 outbox            ✅
+#19  패키지 구조 정리                 ✅
 ```
 
-#### Windows — Git Bash
+**API 16개가 전부 구현되고 실물 검증까지 끝났습니다.** 남은 것은
+[10장](#10-아직-안-한-것) 에 있습니다.
 
-Git for Windows를 설치하면 함께 들어오는 Git Bash에서 실행합니다. **Windows에서는 이 방법을 권장합니다.** 명령어는 macOS와 같고 `sed -i` 뒤에 빈 인자만 없습니다.
+<br><br>
 
-```bash
-NEW=place        # 소문자 서비스명
-CLASS=Place      # 첫 글자만 대문자로 바꾼 것
+---
 
-# 1) 패키지 폴더 이름 변경 (main, test 양쪽)
-mv src/main/java/com/pawtrail/template src/main/java/com/pawtrail/$NEW
-mv src/test/java/com/pawtrail/template src/test/java/com/pawtrail/$NEW
+## 1. 로컬에서 띄우기
 
-# 2) 소스 안의 package 선언과 import 치환
-grep -rl "com.pawtrail.template" src | xargs sed -i "s/com\.pawtrail\.template/com.pawtrail.$NEW/g"
+**공통 환경(JDK · Docker · IntelliJ · GitHub 토큰)은 갖춰져 있다고 봅니다.**
+없다면 `service-template` README 3장을 먼저 봅니다.
 
-# 3) 클래스 파일 이름 변경 (main, test 양쪽)
-mv src/main/java/com/pawtrail/$NEW/TemplateApplication.java \
-   src/main/java/com/pawtrail/$NEW/${CLASS}Application.java
-mv src/test/java/com/pawtrail/$NEW/TemplateApplicationTests.java \
-   src/test/java/com/pawtrail/$NEW/${CLASS}ApplicationTests.java
+<br><br>
 
-# 4) 소스 안의 클래스명 치환
-grep -rl "TemplateApplication" src | xargs sed -i "s/TemplateApplication/${CLASS}Application/g"
-```
+---
 
-#### Windows — PowerShell
+### 1-1. auth 만의 준비물
 
-Git Bash를 쓸 수 없을 때만 사용합니다. 파일을 다시 쓰는 과정에서 인코딩이 바뀌면 한글 주석이 깨질 수 있으므로 **PowerShell 7 이상**에서 실행합니다.
+다른 서비스와 달리 **바깥 시스템 둘을 씁니다.** 그래서 코드 밖에서 먼저 받아 와야
+하는 값이 있습니다.
 
-```powershell
-$NEW   = "place"    # 소문자 서비스명
-$CLASS = "Place"    # 첫 글자만 대문자로 바꾼 것
-
-# 1) 패키지 폴더 이름 변경 (main, test 양쪽)
-Rename-Item "src\main\java\com\pawtrail\template" $NEW
-Rename-Item "src\test\java\com\pawtrail\template" $NEW
-
-# 2) 소스 안의 package 선언과 import 치환
-Get-ChildItem -Path src -Recurse -File | ForEach-Object {
-    (Get-Content $_.FullName -Raw) `
-        -replace "com\.pawtrail\.template", "com.pawtrail.$NEW" `
-        -replace "TemplateApplication", "${CLASS}Application" |
-        Set-Content $_.FullName -NoNewline -Encoding utf8
-}
-
-# 3) 클래스 파일 이름 변경 (main, test 양쪽)
-Rename-Item "src\main\java\com\pawtrail\$NEW\TemplateApplication.java" "${CLASS}Application.java"
-Rename-Item "src\test\java\com\pawtrail\$NEW\TemplateApplicationTests.java" "${CLASS}ApplicationTests.java"
-```
-
-#### 제대로 바뀌었는지 확인
-
-아래 명령이 **아무것도 출력하지 않으면** 성공입니다. 무언가 출력된다면 그 파일에 옛 이름이 남아 있는 것이므로 직접 고칩니다.
-
-```bash
-# macOS / Git Bash
-grep -r "com.pawtrail.template\|TemplateApplication" src
-```
-
-```powershell
-# PowerShell
-Select-String -Path src\*.* -Pattern "com\.pawtrail\.template|TemplateApplication" -Recurse
-```
-
-**파일 이름도 함께 확인합니다.** 위 명령은 파일 *내용*만 검사합니다. 클래스 이름은 바뀌었는데 파일 이름이 그대로 남아 있으면, 테스트 클래스는 `public` 이 아니라 컴파일은 통과하고 이름만 어긋난 채 남습니다.
-
-```bash
-# main, test 양쪽에 Template 이 들어간 파일이 없어야 합니다
-find src -name "Template*"
-```
-
-### 1-2. 이미 IntelliJ로 연 뒤에 바꿨다면
-
-프로젝트 정보가 이전 이름으로 캐시되어 있어 모듈을 제대로 인식하지 못합니다. IntelliJ를 닫고 프로젝트 루트의 `.idea` 폴더와 `*.iml` 파일을 지운 다음 다시 열면 처음부터 다시 인식합니다. 소스 코드에는 영향이 없습니다.
-
-### 1-3. 직접 고쳐야 하는 파일
-
-치환 스크립트로 처리되지 않는 파일들입니다. 아래 예시는 모두 `place-service` 를 만드는 경우입니다.
-
-**먼저 이름이 두 종류라는 것을 알아 둡니다.** 자바 패키지에는 하이픈을 쓸 수 없어 `com.pawtrail.place-service` 가 불가능하므로, 자리에 따라 값이 갈립니다.
-
-| 자리 | 값 | 예시 |
+| 준비물 | 어디서 | 왜 |
 |---|---|---|
-| 저장소명 | 전체 이름 | `place-service` |
-| 이미지명 (`Jenkinsfile` 의 `serviceName`) | 전체 이름 | `place-service` |
-| `spring.application.name` | 전체 이름 | `place-service` |
-| `config` 저장소의 파일명 | 전체 이름 | `place-service.yml` |
-| 유레카 등록 이름 | 전체 이름 | `place-service` |
-| `settings.gradle` 의 `rootProject.name` | 전체 이름 | `place-service` |
-| 자바 패키지 | **접미사를 뗀 이름** | `com.pawtrail.place` |
-| 앱 클래스 | **접미사를 뗀 이름** | `PlaceApplication` |
+| RS256 개인키 | 팀장이 만들어 전달 | 토큰에 서명합니다. **팀에서 하나만 씁니다** |
+| Gmail 앱 비밀번호 | 팀장이 전달 | 인증 코드 메일을 보냅니다 |
+| 구글 클라이언트 시크릿 | 팀장이 전달 | 소셜 로그인 |
+| 구글 테스트 사용자 등록 | 팀장에게 내 구글 주소를 알림 | 앱이 Testing 상태라 등록된 사람만 로그인됩니다 |
 
-아래 여섯 줄은 전부 **저장소 바깥과 맺는 계약**이라 한 글자라도 어긋나면 다른 시스템이 이 서비스를 찾지 못합니다. 이미지 태그, 설정 파일 조회, 유레카 등록과 게이트웨이의 `lb://`, Loki 라벨과 Zipkin 서비스 이름이 모두 이 문자열에 걸려 있습니다.
+> **셋 다 사람이 전달합니다.** 저장소 어디에도 없고 config 저장소에도 없습니다.
+> 값을 받으면 **환경변수에 넣고 "넣었다" 만 알리면 됩니다.** 채팅에 붙여넣지 않습니다.
 
-반대로 자바 패키지는 **이 저장소 안에서만 쓰이므로** 배포에 관여하지 않습니다. 규칙은 이렇습니다.
+---
 
-> 패키지와 클래스명은 저장소명에서 `-service` 접미사를 떼고 하이픈을 지운 것입니다.
+**RS256 개인키가 하나여야 하는 이유입니다.**
 
-`-server` 는 떼지 않습니다. `gateway-server` 는 그 물건의 이름 자체이므로 `com.pawtrail.gatewayserver` 가 되고, `-service` 는 "도메인 서비스"라는 분류 꼬리표라 패키지 안에서는 의미가 없습니다.
+```
+auth  ──▶  개인키로 서명한 토큰 발급
+                  │
+                  ▼
+게이트웨이  ──▶  공개키로 서명을 검증        공개키는 config 저장소에 있음
 
-#### settings.gradle
-
-프로젝트 이름을 바꿉니다. 이 값이 빌드 산출물 jar 이름이 되므로 Dockerfile과도 연결됩니다. **저장소명을 그대로 씁니다.**
-
-```groovy
-// 바꾸기 전
-rootProject.name = 'template'
-
-// 바꾸기 후
-rootProject.name = 'place-service'
+개인키와 공개키는 한 쌍이라 다른 개인키로 만든 토큰은 게이트웨이가 거부함
+  → 팀원마다 다른 키를 쓰면 서로의 토큰이 안 통함
 ```
 
-#### gradle.properties
+로컬 개발용 키이고 **배포할 때는 새 쌍을 만듭니다.** [7-4](#7-4-키-페어를-새로-만들-때) 참고.
 
-공통 모듈 버전을 최신으로 맞춥니다. **템플릿에 적힌 값이 최신이 아닐 수 있으므로** 조직 Packages 페이지에서 확인한 뒤 다르면 고칩니다.
+<br><br>
 
-```properties
-commonVersion=0.0.4
+---
+
+### 1-2. 환경변수
+
+IntelliJ 실행 구성의 **Environment variables** 에 넣습니다.
+넣는 방법은 `service-template` README 4-4 에 있습니다.
+
+| 이름 | 값 | 무엇에 쓰나 |
+|---|---|---|
+| `DB_HOST` | `localhost` | 로컬 PostgreSQL |
+| `SERVICE_DB_PASSWORD` | `infra/.env` 와 같은 값 | `auth_svc` 계정 비밀번호 |
+| `AUTH_JWT_PRIVATE_KEY_B64` | 전달받은 값 | 토큰 서명 (Base64 한 줄) |
+| `AUTH_MAIL_PASSWORD` | 전달받은 16자리 | Gmail SMTP |
+| `AUTH_OAUTH_GOOGLE_CLIENT_SECRET` | 전달받은 값 | 구글 토큰 교환 |
+
+```
+DB_HOST=localhost;SERVICE_DB_PASSWORD=...;AUTH_JWT_PRIVATE_KEY_B64=...;AUTH_MAIL_PASSWORD=...;AUTH_OAUTH_GOOGLE_CLIENT_SECRET=...
 ```
 
-이 값만 바꾸고 다시 빌드하면 새 버전이 내려옵니다. 올리는 절차와 주의할 점은 3-3에 있습니다.
+---
 
-#### src/main/resources/application.yml
+**빠뜨리면 이렇게 됩니다.**
 
-**이 파일에서 고칠 것은 서비스 이름 한 줄뿐입니다.** 포트·데이터베이스·주소는 모두 `paw-trail/config` 저장소에 있으며 설정 서버가 내려줍니다.
-
-```yaml
-# 바꾸기 전
-spring:
-  application:
-    name: template-service
-  config:
-    import: "optional:configserver:http://${CONFIG_HOST:localhost}:8888"
-  profiles:
-    default: local
-```
-
-```yaml
-# 바꾸기 후
-spring:
-  application:
-    name: place-service
-  config:
-    import: "optional:configserver:http://${CONFIG_HOST:localhost}:8888"
-  profiles:
-    default: local
-```
-
-세 줄의 뜻은 각각 이렇습니다.
-
-| 키 | 하는 일 |
+| 빠진 것 | 증상 |
 |---|---|
-| `spring.application.name` | 설정 서버에서 **이 이름의 파일을 찾습니다.** 저장소명·이미지명·유레카 등록 이름과도 같아야 합니다 |
-| `spring.config.import` | 설정을 받아 올 주소입니다. **`optional:` 이 붙어 있어 설정 서버가 없어도 기동됩니다** |
-| `spring.profiles.default` | 아무도 프로파일을 정해 주지 않으면 `local` 로 봅니다. `active` 가 아니라 `default` 인 것이 중요하며, 컨테이너의 `SPRING_PROFILES_ACTIVE=dev` 가 이깁니다 |
+| `DB_HOST` | `UnknownHostException: ${DB_HOST}` — 기동 실패 |
+| `SERVICE_DB_PASSWORD` | `password authentication failed for user "auth_svc"` |
+| `AUTH_JWT_PRIVATE_KEY_B64` | 기동 실패. `JwtProperties` 가 빈 값을 거부합니다 |
+| `AUTH_MAIL_PASSWORD` | **기동은 됩니다.** 메일을 보낼 때 `535 Authentication failed` |
+| `AUTH_OAUTH_GOOGLE_CLIENT_SECRET` | **기동은 됩니다.** 구글 콜백에서 `invalid_client` |
 
-`optional:` 을 붙이는 이유는 서비스 하나만 띄워 확인하는 일이 잦기 때문입니다. 이것이 없으면 매번 설정 서버를 함께 띄워야 하고 테스트도 실패합니다. 다만 **데이터베이스 주소가 내려오지 않으므로 실제 기동은 설정 서버가 떠 있어야 합니다.**
+> 메일과 구글은 **기동 시점에 검증하지 않습니다.** 값이 틀렸는지는 실제로 부를 때
+> 드러나므로 [1-4](#1-4-테스트-계정-만들기) 에서 한 번씩 확인합니다.
 
-`${CONFIG_HOST:localhost}` 에 기본값을 붙이는 것은 의도입니다. 로컬에서는 언제나 `localhost:8888` 이므로 기본값이 정답이고, 없으면 개발자마다 실행 구성에 환경 변수를 넣어야 합니다.
+---
 
-#### config 저장소에 이 서비스의 설정 파일 만들기
+**Gmail 앱 비밀번호는 띄어쓰기를 지웁니다.**
 
-**복제 직후 반드시 해야 하는 작업입니다.** 이 파일이 없으면 포트와 데이터베이스 주소가 내려오지 않아 기동에 실패합니다.
+구글이 보여 주는 값은 `abcd efgh ijkl mnop` 처럼 4자리씩 띄어 있는데
+**붙여서 16자리로 넣어야 합니다.** 그대로 넣으면 인증에 실패하고 오류는
+*"비밀번호가 틀렸다"* 로만 나옵니다.
 
-`paw-trail/config` 저장소 루트에 `<서비스명>.yml` 을 만듭니다.
+<br><br>
 
-```yaml
-# =============================================================================
-# 2계층 — place-service
-# =============================================================================
-# 장소 담당임
-#
-# 호스트는 3계층의 app.datasource.host 에서 오고 비밀번호는 1계층에 있음
-# 계정 10개가 같은 비밀번호를 쓰므로 여기에는 계정명만 둠
-# =============================================================================
+---
 
-server:
-  port: 8084
-
-spring:
-  datasource:
-    url: jdbc:postgresql://${app.datasource.host}:5432/place_db
-    username: place_svc
-
-app:
-  outbox:
-    relay:
-      # place.updated 를 발행함
-      enabled: true
-```
-
-- **포트**는 2-3절의 배정표를 따릅니다
-- **데이터베이스 계정**은 `<서비스>_svc` 형식입니다. `<서비스>_user` 가 아닙니다
-- **`app.outbox.relay.enabled`** 는 이벤트를 발행하는 서비스에서만 `true` 로 둡니다. 인스턴스를 여러 개 띄우는 서비스라면 한 인스턴스에서만 켭니다
-- **`app.auditor.system-name`** 은 1계층에 `SYSTEM` 으로 있으므로 배치가 아니면 적지 않습니다. `ingest` 와 `extract` 만 각각 `ingest-batch`, `extract-batch` 로 덮습니다
-- 데이터베이스를 쓰지 않는 서비스는 `server.port` 만 적습니다
-
-설정 계층과 값을 어디에 둘지는 4장에, `config` 저장소 자체의 규칙은 그 저장소의 README에 있습니다.
-
-#### 게이트웨이에 이 서비스의 라우트 열기
-
-**바로 위 작업과 짝입니다.** 설정 파일만 만들면 서비스는 정상으로 뜨고 유레카에도 등록되지만, **브라우저에서 이 서비스의 API 를 부를 수 없습니다.**
+### 1-3. 띄우고 확인하기
 
 ```
-서비스는 UP · 유레카 대시보드에도 보임
-브라우저 → 게이트웨이 → 404 ROUTE_NOT_FOUND
+① docker compose up -d                 infra 저장소에서 (Kafka · Redis · PostgreSQL · 플랫폼 3개)
+        │
+        ▼
+② IntelliJ 실행 구성에 환경변수 4개      AUTH_JWT_PRIVATE_KEY_B64 · AUTH_MAIL_PASSWORD
+        │                             AUTH_OAUTH_GOOGLE_CLIENT_SECRET · SERVICE_DB_PASSWORD
+        ▼
+③ AuthApplication 실행                 30초 안팎
+        │
+        ├──▶  설정 서버에서 auth-service.yml 을 받음
+        ├──▶  Flyway 가 V20 ~ V23 을 실행해 테이블을 만듦
+        └──▶  유레카에 auth-service 로 등록
+        │
+        ▼
+④ curl localhost:8081/actuator/health          {"status":"UP"}
+        │
+        ▼
+⑤ curl localhost:8080/api/v1/auth/me            401 이면 게이트웨이까지 이어진 것
+                                                (토큰이 없어서 401 — 정상)
 ```
 
-게이트웨이는 라우트 목록에 없는 경로를 그냥 404로 돌려보냅니다. **이 서비스의 로그에는 아무것도 남지 않으므로** 서비스를 아무리 들여다봐도 원인이 드러나지 않습니다.
+---
 
-`paw-trail/config` 저장소의 `gateway-server.yml` 에서 `routes` 아래에 한 덩어리를 추가합니다.
+**① 컨테이너를 띄웁니다.**
 
-```yaml
-            - id: place-service
-              uri: lb://place-service
-              predicates:
-                - Path=/api/v1/places/{placeId},/api/v1/places/{placeId}/documents
+**macOS · Windows 공통**
+
+```bash
+cd <infra 경로>
+docker compose up -d
+docker compose ps           # 전부 (healthy) 인지
+```
+
+기본 프로파일에 `db` 가 들어 있어 PostgreSQL 도 함께 뜹니다.
+`auth_db` 와 `auth_svc` 계정은 초기화 스크립트가 만들어 둡니다.
+
+---
+
+**③ 기동 로그에서 볼 것입니다.**
+
+```
+The following 1 profile is active: "local"                     ← local 이어야 함
+Flyway: Successfully applied 4 migrations to schema "public"     ← V20 ~ V23 (처음 한 번)
+Registered instance AUTH-SERVICE/... with status: UP             ← 유레카 등록
+Tomcat started on port 8081                                      ← 포트
+```
+
+> `Flyway: Schema "public" is up to date` 면 두 번째 기동입니다. 정상입니다.
+
+---
+
+**④⑤ 두 포트로 확인합니다.**
+
+**macOS**
+
+```bash
+curl http://localhost:8081/actuator/health          # auth 직접
+curl http://localhost:8080/api/v1/auth/me           # 게이트웨이 경유
+```
+
+**Windows (PowerShell)**
+
+```powershell
+curl.exe http://localhost:8081/actuator/health
+curl.exe http://localhost:8080/api/v1/auth/me
+```
+
+| 부른 곳 | 정상 응답 | 뜻 |
+|---|---|---|
+| 8081 `/actuator/health` | `{"status":"UP"}` | auth 가 떴습니다 |
+| 8080 `/api/v1/auth/me` | `401` + `{"code":"AUTHENTICATION_FAILED"...}` | 게이트웨이가 auth 를 찾았고, 토큰이 없어 막은 것 |
+| 8080 `/api/v1/auth/me` | `503` | 게이트웨이가 유레카에서 auth 를 못 찾음. **30초 기다렸다 다시** |
+| 8080 `/api/v1/auth/me` | `404` | 라우트가 없음. config 의 `gateway-server.yml` 확인 |
+
+> **8080 과 8081 을 구분하는 것이 이 서비스에서 특히 중요합니다.**
+> 인증이 필요한 API 는 게이트웨이가 헤더를 넣어 줘야 동작하므로
+> **8081 로 직접 부르면 언제나 401** 입니다. [9장](#9-막히기-쉬운-자리) 참고.
+
+<br><br>
+
+---
+
+### 1-4. 테스트 계정 만들기
+
+**가입은 이메일 인증을 거쳐야 합니다.** 실제 메일을 받아 코드를 넣는 것이 정석이고,
+급할 때는 Redis 에 인증 표시를 직접 넣어 건너뜁니다.
+
+---
+
+**정석 — 메일로 인증합니다.**
+
+**macOS**
+
+```bash
+# ① 코드 발송 — 내 메일함에 6자리가 옴
+curl -X POST http://localhost:8080/api/v1/auth/email/verify-request \
+  -H "Content-Type: application/json" \
+  -d '{"email":"me@example.com"}'
+
+# ② 코드 확인
+curl -X POST http://localhost:8080/api/v1/auth/email/verify \
+  -H "Content-Type: application/json" \
+  -d '{"email":"me@example.com","code":"123456"}'
+
+# ③ 가입
+curl -X POST http://localhost:8080/api/v1/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"me@example.com","password":"test1234","nickname":"테스트"}'
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$h = @{ "Content-Type" = "application/json; charset=utf-8" }
+$b = [System.Text.Encoding]::UTF8
+
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/auth/email/verify-request `
+  -Headers $h -Body $b.GetBytes('{"email":"me@example.com"}')
+
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/auth/email/verify `
+  -Headers $h -Body $b.GetBytes('{"email":"me@example.com","code":"123456"}')
+
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/auth/signup `
+  -Headers $h -Body $b.GetBytes('{"email":"me@example.com","password":"test1234","nickname":"테스트"}')
+```
+
+> PowerShell 은 **한글을 바이트로 바꿔 보냅니다.** 안 그러면 닉네임이 `???` 로 저장됩니다.
+> 메일이 안 오면 **스팸함**을 봅니다. 개인 Gmail 발신이라 거기로 갈 수 있습니다.
+
+---
+
+**지름길 — Redis 에 인증 표시를 직접 넣습니다.**
+
+```bash
+docker compose exec redis redis-cli SET "emailverified:me@example.com" 1 EX 1800
+```
+
+이 키가 있으면 `signup` 이 *"인증을 마쳤다"* 고 봅니다. **30분 뒤 사라집니다.**
+
+> 메일 설정이 안 됐거나 여러 계정을 빨리 만들 때 씁니다.
+> `AUTH_MAIL_PASSWORD` 가 맞는지는 이 방법으로는 확인되지 않습니다.
+
+---
+
+**로그인하고 쿠키를 받습니다.**
+
+```bash
+curl -c cookies.txt -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"me@example.com","password":"test1234"}'
+
+curl -b cookies.txt http://localhost:8080/api/v1/auth/me
+```
+
+`-c` 가 쿠키를 파일에 저장하고 `-b` 가 그것을 실어 보냅니다.
+**두 번째가 200 이면 로그인부터 인증까지 전부 이어진 것입니다.**
+
+```json
+{
+  "code": "SUCCESS",
+  "data": {
+    "accountId": "01a0582d-d666-7b62-8541-129e42772053",
+    "email": "me@example.com",
+    "role": "USER",
+    "authProvider": "LOCAL"
+  }
+}
+```
+
+---
+
+**계정을 지우고 다시 하려면**
+
+```bash
+docker compose exec postgres psql -U auth_svc -d auth_db \
+  -c "DELETE FROM refresh_token_log; DELETE FROM outbox; DELETE FROM account;"
+docker compose exec redis redis-cli FLUSHDB
+```
+
+> `FLUSHDB` 는 **`emailverified:` 표시도 지웁니다.** 인증을 마친 뒤에 비우면
+> 가입이 `EMAIL_NOT_VERIFIED` 로 막힙니다. 순서에 주의합니다.
+
+<br><br>
+
+---
+
+## 2. 인증이 어떻게 도는가
+
+**API 를 부르기 전에 이 장을 한 번 읽으면 3장이 훨씬 쉽습니다.**
+
+<br><br>
+
+---
+
+### 2-1. 세션이 아니라 JWT 입니다
+
+로그인 상태를 기억하는 방식이 두 가지 있습니다.
+
+| | 세션 | JWT (우리 방식) |
+|---|---|---|
+| 서버가 기억하나 | 예. 서버 메모리나 DB 에 "누가 로그인했는지" 를 둠 | **아니오.** 토큰 안에 그 정보가 들어 있음 |
+| 서버가 여러 대면 | 세션 저장소를 공유해야 함 | 공개키만 있으면 어느 서버든 검증 가능 |
+| 로그아웃 | 서버가 세션을 지우면 끝 | **즉시 무효화가 안 됨.** 만료까지 살아 있음 |
+| 우리 구조에서 | 서비스 14개가 세션을 공유해야 함 | **게이트웨이 하나가 검증하고 서비스들은 헤더만 믿음** |
+
+**JWT** 는 `헤더.페이로드.서명` 세 덩이를 점으로 이은 문자열입니다.
+
+```
+eyJhbGciOiJSUzI1NiJ9 . eyJzdWIiOiIwMWEwNTgyZC0uLi4iLCJyb2xlIjoiVVNFUiIsInR5cCI6ImFjY2VzcyIsImV4cCI6MTc1NjcxMjAwMH0 . MEUCIQD...
+     헤더                                  페이로드 (Base64 — 누구나 읽을 수 있음)                              서명
+     {"alg":"RS256"}                       {"sub":"01a0...","role":"USER","typ":"access","exp":1756712000}        개인키로 만듦
+```
+
+> **페이로드는 암호화가 아닙니다.** 누구나 읽을 수 있고, 다만 **고치면 서명이 안 맞아
+> 게이트웨이가 거부합니다.** 그래서 비밀번호 같은 것은 절대 담지 않습니다.
+
+---
+
+**토큰에 든 값입니다.**
+
+| claim | 값 | 뜻 |
+|---|---|---|
+| `sub` | 계정 UUID | **이 값이 `X-User-Id` 가 됩니다** |
+| `role` | `USER` · `ADMIN` | 이 값이 `X-User-Role` 이 됩니다 |
+| `typ` | `access` · `refresh` | 두 토큰을 구분합니다 |
+| `exp` | 만료 시각 | 게이트웨이가 검사합니다 |
+| `iat` | 발급 시각 | 토큰 일괄 폐기의 기준입니다 |
+| `jti` | 토큰 고유 ID | 리프레시 토큰의 Redis 키입니다 |
+| `iss` | `pawtrail-auth` | 발급자 |
+
+<br><br>
+
+---
+
+### 2-2. 토큰이 두 개인 이유
+
+```
+로그인 성공
+    │
+    ├──▶  access_token   30분     Path=/                 모든 요청에 실려 감
+    │                            게이트웨이가 서명·만료·typ 을 보고 통과시킴
+    │                            auth 는 이것을 저장하지 않음 (무상태)
+    │
+    └──▶  refresh_token  14일     Path=/api/v1/auth      갱신·로그아웃에만 실려 감
+                                 Redis 에 refresh:{jti} 로 저장됨
+                                 쓸 때마다 새것으로 교체됨 (로테이션)
+```
+
+---
+
+**하나만 쓰면 한쪽이 무너집니다.**
+
+| 토큰 하나를 | 문제 |
+|---|---|
+| 30분짜리만 | 30분마다 다시 로그인해야 합니다 |
+| 14일짜리만 | 유출되면 14일 동안 누구나 그 계정입니다. 회수할 방법도 없습니다 |
+
+**둘로 나누면** 자주 나가는 액세스 토큰은 짧게 두어 유출 피해를 줄이고,
+리프레시 토큰은 갱신할 때만 나가게 해 노출을 줄입니다.
+
+---
+
+**`typ` claim 이 둘을 가릅니다.**
+
+| 어디서 | 받는 것 | 다른 것이 오면 |
+|---|---|---|
+| 게이트웨이 | `access` 만 | 401 |
+| `POST /refresh` · `/logout` | `refresh` 만 | 401 |
+
+> 이것이 없으면 **리프레시 토큰을 `access_token` 쿠키에 넣어 14일간 쓸 수 있고,**
+> 반대로 액세스 토큰을 `/refresh` 에 보내면 복제로 오인되어 **계정이 통째로 잠깁니다.**
+
+<br><br>
+
+---
+
+### 2-3. 왜 쿠키인가
+
+토큰을 브라우저 어디에 둘지가 두 가지입니다.
+
+| | localStorage + Authorization 헤더 | HttpOnly 쿠키 (우리 방식) |
+|---|---|---|
+| 자바스크립트가 읽을 수 있나 | 예 | **아니오** |
+| XSS (스크립트 주입) 에 | **토큰이 통째로 털림** | 안전 |
+| CSRF (다른 사이트에서 요청 위조) 에 | 안전 | `SameSite=Strict` 로 막음 |
+| 프론트가 할 일 | 매 요청에 헤더를 붙임 | **없음.** 브라우저가 자동으로 실음 |
+
+**XSS 는 라이브러리 하나만 오염돼도 터지고, CSRF 는 쿠키 속성 하나로 막힙니다.**
+그래서 쿠키를 골랐습니다.
+
+---
+
+**쿠키 속성입니다.**
+
+```
+Set-Cookie: access_token=...;  HttpOnly; SameSite=Strict; Path=/;            Max-Age=1800
+Set-Cookie: refresh_token=...; HttpOnly; SameSite=Strict; Path=/api/v1/auth; Max-Age=1209600
+```
+
+| 속성 | 뜻 |
+|---|---|
+| `HttpOnly` | 자바스크립트가 못 읽습니다 |
+| `SameSite=Strict` | 다른 사이트에서 시작된 요청에는 안 실립니다 |
+| `Path=/api/v1/auth` | 리프레시 토큰은 **이 경로 아래로만** 나갑니다 |
+| `Secure` | HTTPS 에서만 실립니다. **로컬(`local` 프로파일)에서는 빠집니다** |
+
+> **프론트는 토큰을 볼 수 없으므로 로그인 여부를 `GET /auth/me` 로만 알 수 있습니다.**
+> 200 이면 로그인, 401 이면 아닙니다.
+
+<br><br>
+
+---
+
+### 2-4. auth 와 게이트웨이의 역할 분담
+
+```
+개인키 (환경변수)      공개키 (config 저장소)
+ │                        │
+ ▼                        ▼
+auth  ──▶  토큰  ──▶  게이트웨이     서명 확인 → sub · role · typ 을 꺼냄
+서명함                  검증만 함
+
+개인키가 새면   누구나 유효한 토큰을 만들 수 있음  →  환경변수에만, 절대 커밋 안 함
+공개키가 새면   아무 일도 없음                   →  config 저장소에 그대로 둠
+```
+
+**auth 가 하는 것과 안 하는 것입니다.**
+
+| auth 가 함 | auth 가 안 함 |
+|---|---|
+| 토큰 발급 (로그인 · 갱신 · 소셜) | 매 요청의 토큰 검증 — 게이트웨이 |
+| 리프레시 토큰 저장 · 폐기 | `X-User-Id` 헤더 붙이기 — 게이트웨이 |
+| 계정 관리 (가입 · 비밀번호 · 탈퇴) | 프로필 · 닉네임 — user 서비스 |
+
+> **auth 도 자기 API 에서는 헤더를 믿습니다.** `GET /me` 가 받는 `X-User-Id` 는
+> 게이트웨이가 넣어 준 것이고, auth 는 자기가 만든 토큰이라도 직접 파싱하지 않습니다.
+> 갱신·로그아웃만 예외로 리프레시 토큰을 직접 읽습니다.
+
+<br><br>
+
+---
+
+### 2-5. 로그인부터 로그아웃까지
+
+```
+[ 로그인 ]
+브라우저  ──▶  게이트웨이  ──▶  auth
+                              POST /login  {email, password}
+                                │
+                                ├──▶  비밀번호 대조 (BCrypt)
+                                ├──▶  토큰 2개 발급 · Redis 에 리프레시 저장 · 이력 1행
+                                └──▶  Set-Cookie 2개로 응답
+                                       (auth 는 여기서 손을 뗌)
+
+[ 그 뒤 모든 요청 ]
+브라우저  ──▶  게이트웨이  ──▶  place · pet · user ...
+   쿠키 자동 첨부     │
+                    ├──▶  access_token 쿠키의 JWT 를 공개키로 검증
+                    ├──▶  typ 이 access 인지 · 만료 안 됐는지
+                    └──▶  X-User-Id · X-User-Role 헤더를 붙여 넘김
+                           auth 는 관여하지 않음
+
+[ 30분 뒤 ]
+브라우저  ──▶  게이트웨이  ──▶  place ...
+                    └──▶  401 (액세스 토큰 만료)
+   │
+   └──▶  프론트 인터셉터가 자동으로  POST /api/v1/auth/refresh
+                                    │
+                                    ├──▶  refresh_token 쿠키의 jti 로 Redis 조회
+                                    ├──▶  새 토큰 2개 발급 · 옛 리프레시 폐기
+                                    └──▶  Set-Cookie 2개
+   │
+   └──▶  원래 요청을 다시 보냄  →  200
+
+[ 로그아웃 ]
+브라우저  ──▶  게이트웨이  ──▶  auth   POST /logout
+                                └──▶  Redis 에서 refresh:{jti} 삭제 · 쿠키 2개 만료
+                                       액세스 토큰은 최대 30분 더 살아 있음 (JWT 라 회수 불가)
+```
+
+---
+
+**프론트가 맞춰야 하는 것입니다.**
+
+| | 왜 |
+|---|---|
+| 401 을 받으면 `/refresh` 를 부르고 원래 요청을 재시도하는 인터셉터 | 30분마다 사용자가 로그인하지 않게 |
+| 동시에 여러 요청이 401 을 받았을 때 `/refresh` 를 한 번만 부르는 큐잉 | 여러 번 부르면 뒤엣것이 옛 토큰이라 거부됨 |
+| 로그인 여부를 `GET /auth/me` 로 판단 | 쿠키를 읽을 수 없으므로 |
+| 닉네임은 `GET /users/me` 로 따로 | auth 응답에 없음 |
+
+<br><br>
+
+---
+
+## 3. API 16개
+
+전부 게이트웨이(`:8080`)를 거쳐 부릅니다. 응답은 공통 형식입니다.
+
+```json
+{ "code": "SUCCESS", "message": "...", "data": { }, "traceId": "..." }
+```
+
+<br><br>
+
+---
+
+### 3-1. 목록
+
+| # | 메서드 | 경로 | 인증 | 하는 일 |
+|---|---|---|---|---|
+| 1 | POST | `/api/v1/auth/email/verify-request` | 불필요 | 가입용 인증 코드 발송 |
+| 2 | POST | `/api/v1/auth/email/verify` | 불필요 | 코드 확인 |
+| 3 | POST | `/api/v1/auth/signup` | 불필요 | 회원가입 |
+| 4 | POST | `/api/v1/auth/login` | 불필요 | 로그인 |
+| 5 | POST | `/api/v1/auth/refresh` | 리프레시 쿠키 | 토큰 갱신 |
+| 6 | POST | `/api/v1/auth/logout` | 리프레시 쿠키 | 로그아웃 |
+| 7 | GET | `/api/v1/auth/me` | **필요** | 내 계정 |
+| 8 | PATCH | `/api/v1/auth/me/password` | **필요** | 비밀번호 변경 |
+| 9 | POST | `/api/v1/auth/password/reset-request` | 불필요 | 재설정 코드 발송 |
+| 10 | POST | `/api/v1/auth/password/reset` | 불필요 | 비밀번호 재설정 |
+| 11 | GET | `/api/v1/auth/oauth/{provider}/authorize` | 불필요 | 구글로 보냄 (302) |
+| 12 | GET | `/api/v1/auth/oauth/{provider}/callback` | 불필요 | 구글에서 돌아옴 (302) |
+| 13 | POST | `/api/v1/auth/withdraw/verify-request` | **필요** | 탈퇴용 인증 코드 발송 |
+| 14 | DELETE | `/api/v1/auth/me` | **필요** | 탈퇴 |
+| 15 | GET | `/api/v1/admin/accounts/outbox` | **ADMIN** | 포기한 이벤트 목록 |
+| 16 | POST | `/api/v1/admin/accounts/outbox/{id}/retry` | **ADMIN** | 재발행 |
+
+> `{provider}` 자리에 지금은 `google` 만 옵니다. 제공자가 늘어도 **경로가 이미
+> 변수로 되어 있어 게이트웨이와 라우트는 안 바뀝니다.**
+
+---
+
+**"인증 불필요" 는 두 곳에 같은 목록이 있습니다.**
+
+| 어디 | 무엇 |
+|---|---|
+| config `gateway-server.yml` 의 `app.gateway.permit-all` | 게이트웨이가 토큰 없이 통과시킴 |
+| config `auth-service.yml` 의 `app.auth.permit-all` | auth 의 보안 체인이 열어 둠 |
+
+```
+/api/v1/auth/signup              /api/v1/auth/login
+/api/v1/auth/refresh             /api/v1/auth/logout
+/api/v1/auth/oauth/**
+/api/v1/auth/password/reset-request    /api/v1/auth/password/reset
+/api/v1/auth/email/verify-request      /api/v1/auth/email/verify
+```
+
+> **9줄이 양쪽에 똑같이 있어야 합니다.** 한쪽에만 빠지면 그 경로가 401 이 됩니다.
+> 게이트웨이에만 빠지면 게이트웨이 로그에 `토큰 쿠키가 없습니다`, auth 에만 빠지면
+> auth 로그에 `인증 실패 (401)` 이 남아 어느 쪽인지 알 수 있습니다.
+>
+> `withdraw/verify-request` 는 **로그인한 사람만 부르므로 여기 없습니다.**
+
+<br><br>
+
+---
+
+### 3-2. 회원가입 — 이메일 인증을 먼저
+
+```
+① POST /email/verify-request  {email}
+        │
+        ├──▶  발송 제한 검사       60초 쿨다운 · 시간당 5통
+        ├──▶  6자리 코드 생성      Redis  emailverify:{email}  TTL 10분
+        └──▶  메일 발송            Gmail SMTP
+        │
+        ▼
+② POST /email/verify  {email, code}
+        │
+        ├──▶  코드 대조            틀리면 시도 횟수 +1, 5회면 코드 폐기
+        └──▶  통과 표시 저장       Redis  emailverified:{email}  TTL 30분
+        │
+        ▼
+③ POST /signup  {email, password, nickname}
+        │
+        ├──▶  emailverified 가 있나          없으면 400 EMAIL_NOT_VERIFIED
+        ├──▶  이미 가입된 이메일인가           있으면 409 EMAIL_ALREADY_EXISTS
+        ├──▶  account 행 INSERT              BCrypt 해시, status ACTIVE
+        ├──▶  outbox 에 account.created      {accountId, email, nickname}
+        └──▶  커밋 뒤 emailverified 삭제      같은 인증으로 두 번 가입 방지
+        │
+        ▼
+④ 201 Created  {accountId, email, role, authProvider}
+        │
+        └──▶  카프카  account.created  ──▶  user 서비스가 프로필을 만듦
+                                            (nickname 은 여기서 저장됨)
+```
+
+---
+
+**왜 이메일 인증이 먼저인가**
+
+`email` 을 계정의 복구 수단(비밀번호 재설정)으로 삼기로 했는데, **인증 없이 가입되면
+그 복구 수단이 남의 것일 수 있습니다.** 아무나 남의 이메일로 계정을 만들어 두면
+진짜 주인은 나중에 *"이미 가입됨"* 으로 막힙니다.
+
+---
+
+**요청과 응답입니다.**
+
+**① 코드 발송**
+
+```http
+POST /api/v1/auth/email/verify-request
+{ "email": "me@example.com" }
+```
+
+| 응답 | 언제 |
+|---|---|
+| 200 | 발송됨 |
+| 409 `EMAIL_ALREADY_EXISTS` | 이미 가입된 이메일. **여기서는 알려 줍니다** — 안 알리면 가입이 왜 안 되는지 모릅니다 |
+| 429 `MAIL_SEND_COOLDOWN` | 60초 안에 다시 요청함, 또는 시간당 5통 초과 |
+| 500 `MAIL_SEND_FAILED` | SMTP 실패. 사용자가 안 오는 메일을 기다리는 것보다 낫습니다 |
+
+**② 코드 확인**
+
+```http
+POST /api/v1/auth/email/verify
+{ "email": "me@example.com", "code": "482913" }
+```
+
+| 응답 | 언제 |
+|---|---|
+| 200 | 통과. 30분 안에 가입해야 합니다 |
+| 400 `INVALID_VERIFICATION_CODE` | 틀림 (남은 시도 횟수가 줄어듦) 또는 만료 |
+| 429 `TOO_MANY_VERIFICATION_ATTEMPTS` | 5회 틀림. 코드가 폐기됐으니 다시 받아야 합니다 |
+
+**③ 가입**
+
+```http
+POST /api/v1/auth/signup
+{ "email": "me@example.com", "password": "test1234", "nickname": "테스트" }
 ```
 
 | 항목 | 규칙 |
 |---|---|
-| `id` | 자유롭게 정하지만 서비스명과 같게 둡니다 |
-| `uri` | `lb://` 뒤의 이름이 **그 서비스의 `spring.application.name` 과 같아야 합니다.** 다르면 유레카에서 주소를 찾지 못해 503이 납니다 |
-| `predicates` | 이 서비스로 보낼 경로입니다. 쉼표로 여러 개를 적을 수 있습니다 |
+| `email` | 형식 검사 |
+| `password` | **8자 이상 72자 이하, 72바이트 이하.** 문자 조합은 강제하지 않습니다 |
+| `nickname` | 30자 이하. **auth 는 저장하지 않고 이벤트로 user 에 넘깁니다** |
 
-한 서비스가 접두사를 여러 개 가지는 경우도 있습니다. 여러 리소스를 한 서비스가 소유하기 때문입니다.
-
-```yaml
-            - id: user-service
-              uri: lb://user-service
-              predicates:
-                - Path=/api/v1/users/**,/api/v1/favorites/**,/api/v1/visits/**,/api/v1/itineraries/**
-
-            - id: pet-service
-              uri: lb://pet-service
-              predicates:
-                - Path=/api/v1/pets/**,/api/v1/breeds
+```json
+201 Created
+{ "data": { "accountId": "01a0...", "email": "me@example.com", "role": "USER", "authProvider": "LOCAL" } }
 ```
 
-**`/api/v1/places/` 아래에는 `/**` 를 쓰지 않습니다.**
-
-이 접두사 아래에는 서비스 6개가 섞여 있습니다. 장소 상세 화면에서 브라우저가 여러 개를 한꺼번에 부르기 때문이며, 경로는 장소를 중심으로 짜여 있고 소유 서비스는 갈려 있습니다.
-
-| 경로 | 가는 곳 |
-|---|---|
-| `/api/v1/places/{placeId}` | place |
-| `/api/v1/places/{placeId}/documents` | place |
-| `/api/v1/places/{placeId}/verdict` | verdict |
-| `/api/v1/places/{placeId}/reviews` | review |
-| `/api/v1/places/{placeId}/conflicts` | policy |
-| `/api/v1/places/{placeId}/congestion` | congestion |
-
-여기에 `Path=/api/v1/places/**` 를 쓰면 **하위 경로를 모두 먹어 나머지 다섯으로 갈 요청이 전부 첫 라우트로 갑니다.** 게이트웨이는 처음 맞는 라우트에서 멈추기 때문입니다. 증상은 "장소 상세에서 판정만 안 뜬다" 인데 게이트웨이 로그에는 아무것도 남지 않습니다.
-
-`{placeId}` 는 **한 마디만 맞추므로** 여섯이 서로 겹치지 않고, 그래서 목록에 적는 순서를 신경 쓰지 않아도 됩니다.
-
-**place 에 하위 경로가 새로 생기면 라우트도 함께 추가합니다.** 추가하지 않으면 404입니다.
-
-**관리자 경로는 따로 적습니다.**
-
-**두 번째 마디가 어느 서비스인지를 정합니다.** 예외 없이 이 규칙을 지키므로 새 관리자 경로를 만들 때도 같은 모양으로 둡니다.
-
-```yaml
-            - id: admin-places
-              uri: lb://place-service
-              predicates:
-                - Path=/api/v1/admin/places/**
-```
-
-이벤트를 발행하는 서비스라면 이 라우트 아래에 **Outbox 재발행 API** 도 함께 들어갑니다. 7장의 「이벤트를 발행하는 서비스는 관리자 재발행 API 를 만듭니다」를 참고합니다.
-
-**인증 없이 열어야 하는 경로가 있다면** 같은 파일의 `app.gateway.permit-all` 에도 추가합니다. 여기 없는 경로는 전부 토큰을 확인합니다.
-
-```yaml
-app:
-  gateway:
-    permit-all:
-      - /api/v1/auth/login
-```
-
-**이 목록에 넣은 경로에는 게이트웨이가 `X-User-Id` 를 넣어주지 않습니다.** 그 서비스가 자기 보안 설정을 따로 정의한다면 **그쪽에서도 같은 경로를 열어야 하며, 한쪽만 열면 401이 납니다.** 같은 목록이 두 곳에 존재하는 셈이므로, 고칠 때는 양쪽을 함께 봅니다.
-
-**확인은 실제로 도는 목록으로 합니다.** 게이트웨이를 다시 띄우거나 `POST /actuator/refresh` 를 부른 뒤 아래를 봅니다.
-
-```powershell
-curl.exe http://localhost:8080/actuator/gateway/routes
-```
-
-내가 쓴 것과 실제로 도는 것이 다를 수 있으므로, 어긋나 보이면 설정 서버가 내려주는 값도 함께 대조합니다.
-
-```powershell
-curl.exe http://localhost:8888/gateway-server/local
-```
-
-#### Dockerfile
-
-
-
-jar 경로가 `settings.gradle`의 이름을 따라갑니다. 아래처럼 와일드카드로 되어 있다면 고치지 않아도 됩니다.
-
-```dockerfile
-# 이 형태라면 그대로 둡니다
-COPY build/libs/*.jar app.jar
-
-# 이름이 박혀 있다면 바꿉니다
-# 바꾸기 전
-COPY build/libs/template-0.0.1-SNAPSHOT.jar app.jar
-# 바꾸기 후
-COPY build/libs/place-service-0.0.1-SNAPSHOT.jar app.jar
-```
-
-**와일드카드가 안전한 것은 `build/libs` 에 jar가 하나만 생기기 때문입니다.** `build.gradle` 맨 아래에서 `jar` 태스크를 꺼 두었습니다.
-
-```gradle
-tasks.named('jar') {
-    enabled = false
-}
-```
-
-이 줄이 없으면 실행 가능한 jar와 함께 클래스만 든 `-plain.jar` 가 만들어집니다. 그러면 와일드카드가 **둘 다 잡는데, 복사 대상이 파일 하나라 어느 쪽이 담길지는 빌드 도구의 파일 정렬 순서에 달립니다.**
-
-잘못 담겨도 **이미지는 정상으로 만들어지고 기동할 때만 실패합니다.**
-
-```
-no main manifest attribute, in app.jar
-```
-
-지금은 우연히 실행 가능한 쪽이 담기지만 이름이 조금만 달라져도 뒤집히므로, **저 줄을 되살리지 않습니다.**
-
-만든 이미지를 확인하려면 아래처럼 봅니다. 실행 가능한 jar는 수십 MB이고 `-plain.jar` 는 몇 KB입니다.
-
-```powershell
-docker run --rm --entrypoint sh <이미지> -c "ls -lh /app"
-```
-
-`--entrypoint` 를 빼면 뒤에 쓴 명령이 대체가 아니라 인자로 붙어 애플리케이션이 그냥 뜹니다.
-
-**공통 모듈은 반대입니다.** 그쪽은 실행되는 앱이 아니라 다른 프로젝트가 의존성으로 쓰는 라이브러리라 `bootJar` 를 끄고 `jar` 를 켭니다.
-
-#### Jenkinsfile
-
-파이프라인 본체는 공유 라이브러리에 있으므로 파라미터 3개만 채웁니다. `deployNode`는 이 서비스가 올라갈 노드이고, `instances`는 띄울 개수입니다. 어느 노드에 몇 개인지는 9장의 분류표와 인프라 문서를 따릅니다.
-
-**`serviceName` 은 저장소명을 그대로 씁니다.** 이 값이 그대로 이미지 태그가 되기 때문입니다. 짧게 적으면 Jenkins 는 `ghcr.io/paw-trail/place` 로 올리는데 배포는 `ghcr.io/paw-trail/place-service` 를 내려받으려 하므로 `manifest unknown` 으로 실패합니다. **배포 시점에야 드러나고 메시지가 이름 문제라는 것을 알려주지 않습니다.**
-
-```groovy
-// 바꾸기 전
-@Library('pawtrail-pipeline') _
-springServicePipeline(
-    serviceName: 'template',
-    deployNode : 'app',
-    instances  : 1
-)
-
-// 바꾸기 후
-@Library('pawtrail-pipeline') _
-springServicePipeline(
-    serviceName: 'place-service',
-    deployNode : 'core',
-    instances  : 1
-)
-```
-
-#### src/main/resources/db/migration/
-
-템플릿에 들어 있는 예시 스크립트를 지우고, 이 서비스의 첫 스크립트를 만듭니다. 파일명은 `V20__<서비스명>.sql`입니다.
-
-```
-바꾸기 전   db/migration/service/V20__template.sql   (예시 내용)
-바꾸기 후   db/migration/service/V20__place.sql      (이 서비스의 테이블 정의)
-```
-
-```sql
--- V20__place.sql 예시
-CREATE TABLE place (
-    id              uuid         PRIMARY KEY,
-    name            VARCHAR(200) NOT NULL,
-    -- ... 이 서비스의 컬럼 정의
-    created_at      TIMESTAMP    NOT NULL,
-    created_by      VARCHAR(45)  NOT NULL,
-    updated_at      TIMESTAMP    NOT NULL,
-    updated_by      VARCHAR(45)  NOT NULL,
-    deleted_at      TIMESTAMP,
-    deleted_by      VARCHAR(45)
-);
-```
-
-**PK는 모든 테이블이 `uuid`입니다.** DB 함수로 만들지 않고 애플리케이션이 `@UuidGenerator(style = UuidGenerator.Style.VERSION_7)` 로 생성해 넣으므로, 스크립트에는 기본값을 지정하지 않습니다. 순차 숫자를 쓰지 않는 이유는 서비스가 여러 개라 `place_id=42` 와 `pet_id=42` 가 구분되지 않고, 순차 ID가 URL에 노출되면 데이터 규모가 드러나기 때문입니다.
-
-마지막 6개 컬럼은 모든 테이블이 공통으로 갖습니다. `BaseEntity`가 이 컬럼들과 짝을 이루므로 빠뜨리면 기동 시 검증에 실패합니다. `created_*` 와 `updated_*` 는 JPA Auditing 이 항상 채우므로 `NOT NULL` 이고, `deleted_*` 는 소프트 딜리트 시점에만 채워지므로 NULL 을 허용합니다.
-
-#### README.md
-
-**지금은 고치지 않습니다.** 이 파일에는 지금 읽고 있는 개발 지침이 들어 있으며, 개발하는 동안 계속 참고하게 됩니다.
-
-구현이 끝난 뒤에 이 지침 내용을 전부 지우고, 해당 서비스에 맞는 README로 새로 작성합니다. 참고용 최종 형태는 다음과 같습니다.
-
-```markdown
-# place
-
-## 역할
-장소 마스터 데이터를 소유하고 조회를 제공합니다.
-
-## 소유 데이터
-place_db — place, place_source_link, place_facility
-
-## 의존
-- 호출하는 서비스: ingest (/internal/raw)
-- 구독하는 이벤트: 없음
-- 발행하는 이벤트: place.updated
-
-## 로컬 실행
-infra 저장소에서 docker compose up -d
-이후 PlaceApplication 을 IntelliJ에서 실행합니다.
-```
-
-의존 관계 항목은 나중에 서비스 간 호출 관계를 파악하는 근거가 되므로 반드시 채웁니다. 서비스가 여러 개이므로 이 항목만 모아 읽으면 전체 호출 관계가 드러납니다.
-
-### 1-4. DB를 사용하지 않는 서비스라면
-
-verdict, congestion, route 처럼 DB 가 없는 서비스는 **네 군데를 지워야 합니다.** 한 곳만 고치면 컴파일이나 기동이 실패하므로 아래 순서대로 함께 처리합니다.
-
-**`extract` 는 이 절을 그대로 따르지 않습니다.** 소유 DB 는 없지만 Spring Batch 가 실행 이력 테이블을 요구하므로, 어디에 둘지 정해진 뒤에 판단합니다. 9장을 먼저 봅니다.
-
-> **왜 지워야 하는가** — 공통 모듈은 클래스패스에 `spring-data-jpa` 가 있으면 JPA 관련 설정을 자동으로 켭니다. DB 가 없는 서비스에서 켜지면 `entityManagerFactory` Bean 을 찾지 못해 기동에 실패합니다. 의존성을 지우면 자동 설정도 함께 꺼집니다.
-
-#### ① `build.gradle` — 데이터·QueryDSL 블록을 통째로
-
-`── 데이터 ──` 주석부터 QueryDSL 블록 끝까지가 대상입니다. **JPA 4줄만 지우면 안 됩니다.** `hibernate-spatial` 과 QueryDSL 이 `hibernate-core` 와 `jakarta.persistence-api` 를 클래스패스에 남겨, 쓰지도 않는 의존성이 이미지에 실리고 애노테이션 프로세서도 계속 돕니다.
-
-```groovy
-    // ── 웹 · 검증 · 보안 · 상태확인 ────────────────────────────
-    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
-    implementation 'org.springframework.boot:spring-boot-starter-validation'
-    implementation 'org.springframework.boot:spring-boot-starter-security'
-    implementation 'org.springframework.boot:spring-boot-starter-actuator'
-
-    // ▼▼▼ 여기부터 지웁니다 ▼▼▼
-    // ── 데이터 ────────────────────────────────────────────────
-    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
-    implementation 'org.springframework.boot:spring-boot-starter-flyway'
-    implementation 'org.flywaydb:flyway-database-postgresql'
-    runtimeOnly   'org.postgresql:postgresql'
-
-    implementation 'org.hibernate.orm:hibernate-spatial'
-
-    // ── QueryDSL ──────────────────────────────────────────────
-    implementation      "io.github.openfeign.querydsl:querydsl-jpa:${querydslVersion}"
-    annotationProcessor "io.github.openfeign.querydsl:querydsl-apt:${querydslVersion}:jpa"
-    annotationProcessor 'jakarta.persistence:jakarta.persistence-api'
-    annotationProcessor 'jakarta.annotation:jakarta.annotation-api'
-    // ▲▲▲ 여기까지 지웁니다 ▲▲▲
-
-    // ── 캐시 · 이벤트 ─────────────────────────────────────────
-    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
-    implementation 'org.springframework.boot:spring-boot-starter-kafka'
-```
-
-테스트 블록 맨 위의 두 줄도 함께 지웁니다. 여기만 남으면 테스트 클래스패스에만 JPA 가 살아남아, 나중에 테스트가 왜 다르게 도는지 찾기 어려워집니다.
-
-```groovy
-    // ── 테스트 ────────────────────────────────────────────────
-    // ▼▼▼ 이 두 줄을 지웁니다 ▼▼▼
-    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'
-    testImplementation 'org.springframework.boot:spring-boot-starter-flyway-test'
-    // ▲▲▲ 여기까지 ▲▲▲
-
-    testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
-```
-
-`spring-data-commons` 는 **지우지 않습니다.** 공통 모듈의 `PageResponse` 가 쓰는 것이고, DB 가 없는 서비스도 목록 응답을 반환합니다.
-
-#### ② `<서비스명>Application.java` — 애노테이션 2줄과 import 2줄
-
-**애노테이션만 지우고 import 를 남기면 컴파일이 실패합니다.** `package org.springframework.data.jpa.repository.config does not exist` 오류가 나는데, 원인이 애노테이션 쪽이라고 생각하기 쉬워 시간을 씁니다.
-
-```java
-package com.pawtrail.verdict;
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.boot.persistence.autoconfigure.EntityScan;              // ← 지웁니다
-import org.springframework.data.jpa.repository.config.EnableJpaRepositories;       // ← 지웁니다
-
-/**
- * ... 주석의 JPA 관련 문단도 함께 정리합니다 ...
- */
-@SpringBootApplication
-@EntityScan(basePackages = {"com.pawtrail.verdict", "com.pawtrail.common"})         // ← 지웁니다
-@EnableJpaRepositories(basePackages = {"com.pawtrail.verdict", "com.pawtrail.common"})  // ← 지웁니다
-public class VerdictApplication {
-```
-
-지우고 나면 이 형태만 남습니다.
-
-```java
-@SpringBootApplication
-public class VerdictApplication {
-
-    public static void main(String[] args) {
-        SpringApplication.run(VerdictApplication.class, args);
-    }
-}
-```
-
-#### ③ config 저장소의 `<서비스명>.yml` — datasource 를 적지 않습니다
-
-서비스 저장소의 `application.yml` 에는 세 줄뿐이므로 지울 것이 없습니다. 대신 **config 저장소에 만드는 2계층 파일에 `spring.datasource` 를 넣지 않습니다.**
-
-```yaml
-# 2계층 — verdict-service
-# DB 를 쓰지 않으므로 datasource 를 두지 않음
-server:
-  port: 8086
-```
-
-1계층의 JPA·Flyway 값은 그대로 내려오지만, **JDBC 의존성 자체를 걷어낸 서비스라 아무 일도 일어나지 않습니다.** 관련 자동 설정이 클래스가 없어 아예 올라오지 않기 때문입니다.
-
-`app.outbox.relay.enabled` 도 적지 않습니다. outbox 테이블이 없으므로 회수 스케줄러가 돌 대상이 없습니다. `app.auditor.system-name` 은 1계층에 `SYSTEM` 으로 있으므로 어차피 적을 일이 없습니다.
-
-#### ④ 폴더 2개
-
-```
-src/main/resources/db/migration/service/  ← 폴더째 지웁니다 (테이블이 없습니다)
-src/main/java/.../infrastructure/persistence/   ← 폴더째 지웁니다 (저장소가 없습니다)
-```
-
-#### 다 지웠는지 확인
-
-아래가 **아무것도 출력하지 않으면** 성공입니다.
-
-```bash
-# macOS / Git Bash
-grep -rn "jpa\|Jpa\|flyway\|Flyway\|querydsl\|QueryDsl\|datasource" build.gradle src/main/java
-```
-
-```powershell
-# PowerShell
-Select-String -Path build.gradle -Pattern "jpa|flyway|querydsl|datasource"
-```
-
-`application.yml` 은 세 줄뿐이므로 검사 대상에 넣지 않습니다.
-
-그다음 빌드가 통과하는지 봅니다.
-
-```bash
-./gradlew compileJava
-```
-
-#### 무상태 서비스가 못 쓰게 되는 것
-
-의존성을 지우면 공통 모듈에서 아래가 함께 꺼집니다. 대신 쓸 수 없게 되는 것이므로 알고 있어야 합니다.
-
-| 못 쓰게 되는 것 | 대신 |
-|---|---|
-| `BaseEntity`, JPA Auditing | 엔티티가 없으므로 필요 없습니다 |
-| `OutboxEventRecorder` (이벤트 발행) | 무상태 서비스는 이벤트를 발행하지 않습니다 |
-| `InboxProcessor` (중복 처리 방지) | 8장 마지막 절을 참고합니다. 이 서비스들이 이벤트로 하는 일은 캐시 삭제뿐이라 중복 처리가 문제되지 않습니다 |
-
-`CommonApiResponse`·`ErrorCode`·`@CurrentUser`·보안 필터는 **그대로 쓸 수 있습니다.** JPA 와 무관한 자동 설정이라 계속 켜집니다.
-
-### 1-5. 공통 모듈은 자동 설정으로 등록됩니다
-
-공통 모듈에는 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 파일이 있어 설정 클래스들이 자동으로 등록됩니다. 이 파일은 **공통 모듈 레포에만 존재하며, 서비스 레포에서는 만들지도 고치지도 않습니다.**
-
-서비스 쪽에서 **따로 해야 할 일은 없습니다.** 의존성만 추가하면 조건에 맞는 Bean 이 알아서 올라옵니다.
-
-#### `scanBasePackages` 에 `com.pawtrail.common` 을 넣지 않습니다
-
-**넣으면 안 됩니다.** 자동 설정과 컴포넌트 스캔 양쪽에 걸리면 같은 설정이 두 번 등록되고, 조건 평가 순서가 깨져 의도와 다른 Bean 이 올라갈 수 있습니다. 스프링 부트도 자동 설정 클래스가 컴포넌트 스캔 대상이 되면 안 된다고 명시하고 있습니다.
-
-템플릿의 `<서비스명>Application.java` 에는 `scanBasePackages` 자체가 없습니다. `@SpringBootApplication` 의 기본 스캔 범위가 그 클래스가 속한 패키지이므로 지정할 필요가 없고, 복제 후 고칠 문자열도 하나 줄어듭니다.
-
-#### 반면 `@EntityScan` 과 `@EnableJpaRepositories` 에는 넣습니다
-
-공통 모듈의 `OutboxMessage`·`ProcessedEvent` 엔티티와 그 레포지터리는 **자동 설정이 잡아주지 않습니다.** 이 둘에는 `com.pawtrail.common` 을 그대로 지정해야 하며, 템플릿에 이미 들어 있습니다.
-
-세 애노테이션이 비슷하게 생겼지만 공통 모듈이 들어가는 곳은 뒤의 둘뿐입니다. 헷갈리기 쉬운 자리라 앱 클래스 주석에도 같은 설명이 있습니다.
-
-### 1-6. 마지막으로 빌드가 되는지 확인합니다
-
-```bash
-# macOS / Git Bash
-./gradlew compileJava
-
-# Windows PowerShell — 앞의 .\ 를 빠뜨리면 명령을 찾지 못합니다
-.\gradlew.bat compileJava
-```
-
-여기서 `compileJava` 만 하는 것은 컴파일만 확인하면 되기 때문입니다. `build` 를 돌리면 테스트가 함께 도는데, 그때 **PostgreSQL 컨테이너가 하나 떴다가 사라집니다.** 놀라지 않아도 되며 자세한 내용은 2-7에 있습니다.
-
-**`BUILD SUCCESSFUL` 만 보고 넘어가지 않습니다.** 그 아래 `actionable tasks: N executed` 줄을 함께 확인합니다. 소스가 컴파일 대상에 잡히지 않으면 Gradle은 아무 일도 하지 않고 성공으로 끝나기 때문입니다. 패키지 경로 치환이 잘못되었을 때 이 형태로 나타납니다.
-
-#### 터미널에서 실행할 때 JAVA_HOME 주의
-
-**터미널의 `gradlew` 는 IntelliJ 설정의 Gradle JVM 을 보지 않고 `JAVA_HOME` 환경변수를 봅니다.** 둘은 별개이므로, IntelliJ 설정이 21로 되어 있어도 터미널에서는 다음과 같은 오류가 날 수 있습니다.
-
-```
-Gradle requires JVM 17 or later to run. Your build is currently configured to use JVM 11.
-```
-
-이때는 `JAVA_HOME` 을 JDK 21 경로로 맞춥니다. 설치 경로는 JDK 배포판마다 다르므로 직접 확인합니다.
-
-```powershell
-# 설치된 21 찾기
-Get-ChildItem "C:\Program Files\*\*" -Directory | Where-Object { $_.Name -like "*21*" } | Select-Object FullName
-
-# 이 터미널에서만 지정 (시스템 설정을 건드리지 않습니다)
-$env:JAVA_HOME = "C:\Program Files\Java\jdk-21"
-```
-
-시스템 환경변수를 직접 바꿨다면 **터미널 창을 새로 열어야** 반영됩니다.
-
-### 1-7. 처음 한 번 해두는 설정과 자주 겪는 것들
-
-서비스를 만들 때마다 반복해서 겪게 되므로 미리 읽어 둡니다.
-
-#### IntelliJ 가 Gradle 프로젝트로 인식하지 못할 때
-
-폴더를 그냥 `Open` 으로 열면 "Load Gradle Project" 알림이 잠깐 떴다 사라지고 **평범한 디렉터리 프로젝트로 열립니다.** 아래 세 가지가 그 지문입니다.
-
-| 지문 | 정상일 때 |
-|---|---|
-| `com`·`pawtrail`·`<서비스명>` 이 폴더 여러 개로 나뉘어 보임 | `com.pawtrail.<서비스명>` 한 줄로 접힙니다 |
-| 트리 맨 아래에 `External Libraries` 노드가 없음 | 의존성 노드가 있습니다 |
-| 실행 구성이 `Current File` 이고 main 옆에 실행 표시가 없음 | 초록 실행 표시가 있습니다 |
-
-해결은 아래 순서로 시도합니다.
-
-```
-① build.gradle 우클릭 → Link Gradle Project
-② Gradle 툴 창의 + 버튼으로 build.gradle 지정
-③ File → Close Project 후 File → Open 에서
-   ★폴더가 아니라 build.gradle 파일 자체를 선택 → Open as Project
-```
-
-③이 가장 확실합니다. 그래도 안 되면 `.idea` 폴더와 `*.iml` 을 지우고 ③을 반복합니다.
-
-붙은 뒤 **Settings → Build Tools → Gradle 의 `Gradle JVM` 이 21인지 확인합니다.** 터미널의 `JAVA_HOME` 과 별개이므로 `gradlew` 가 잘 돌았다고 IntelliJ 도 되는 것이 아닙니다.
-
-#### `bootRun` 의 진행률이 멈춘 것처럼 보입니다
-
-`bootRun` 은 앱이 살아 있는 동안 끝나지 않는 태스크입니다. Gradle 진행 막대가 80% 근처에서 완료로 가지 않고 경과 시간만 올라가는데, **막대가 그 자리에 있다는 것이 곧 앱이 떠 있다는 표시입니다.** 앱을 멈춰야 100% 가 됩니다.
-
-진행 막대 바로 아래 줄이 `> :bootRun` 이면 실행 중이고, `Resolve dependencies of ...` 나 `Download https://...` 면 의존성을 받는 중입니다.
-
-**IntelliJ 의 Run 버튼으로 띄우는 편이 낫습니다.** 콘솔이 평범하게 나오고 중지가 쉽습니다.
-
-첫 빌드가 몇 분 걸리는 것도 정상입니다. Gradle 배포판과 의존성을 처음 받으며, 특히 유레카 클라이언트의 전이 의존성 트리가 큽니다.
-
-#### PowerShell 의 `curl` 은 진짜 curl 이 아닙니다
-
-`Invoke-WebRequest` 의 별칭이라 응답이 객체로 감싸져 나옵니다. 원문을 보려면 **확장자까지 적습니다.**
-
-```powershell
-curl.exe http://localhost:8095/actuator/health
-```
-
-설정 서버의 응답처럼 긴 JSON 은 브라우저로 여는 편이 편합니다.
-
-#### 실행 시 `Command line is too long`
-
-실행하면 애플리케이션이 뜨기 전에 아래 오류가 납니다.
-
-```
-Error running 'XxxApplication'. Command line is too long.
-Shorten the command line and rerun.
-```
-
-스프링 문제가 아니라 Windows 의 명령줄 길이 제한(32,767자)에 걸린 것입니다. 의존성이 많아 클래스패스 문자열이 그 한도를 넘습니다.
-
-```
-Run/Debug Configurations → Modify options → Shorten command line → JAR manifest
-```
-
-클래스패스를 임시 jar 의 매니페스트에 넣어 명령줄에서 빼는 방식입니다.
-
-#### `.properties` 파일의 한글이 깨짐
-
-`gradle.properties` 의 한글 주석이 `?` 나 알 수 없는 문자로 보인다면 편집기 인코딩 문제입니다.
-
-```
-Settings → Editor → File Encodings
-  Default encoding for properties files      UTF-8
-  Transparent native-to-ascii conversion     체크 해제
-```
-
-**설정을 바꾸기 전에 그 파일을 저장하지 않습니다.** 두 가지 상태가 있는데 겉보기로는 구분되지 않습니다.
-
-| 보이는 모습 | 상태 |
-|---|---|
-| `ê³µíµ 모ë` 처럼 알 수 없는 문자 | 파일은 정상이고 화면만 깨진 것입니다. 설정을 바꾸면 복구됩니다 |
-| `# ?? ??` 처럼 물음표 | 이미 그 인코딩으로 저장되어 원본이 사라진 것입니다. 복구되지 않습니다 |
-
-첫 번째 상태에서 파일을 저장하면 두 번째로 넘어갑니다. 한글이 ISO-8859-1 에 없어 물음표로 대체되기 때문입니다.
-
-### 1-8. IntelliJ 에 표시되는 경고 두 가지는 정상입니다
-
-세팅을 마쳐도 IntelliJ 가 아래 두 가지를 빨간 줄로 표시합니다. 컴파일과 기동에는 영향이 없습니다.
-
-| 표시되는 곳 | 이유 |
-|---|---|
-| `<서비스명>Application.java` 의 `@EntityScan`·`@EnableJpaRepositories` 안에 있는 `com.pawtrail.common` | 공통 모듈이 아직 의존성에 없어서입니다. 3장에 따라 공통 모듈을 연결하면 사라집니다 |
-| config 저장소의 `app.auditor.system-name`, `app.outbox.relay.enabled`, `app.logging.loki.url` | 이 프로젝트가 직접 정의한 프로퍼티라 스프링이 아는 목록에 없어서입니다. 서비스 저장소가 아니라 config 저장소에 있으므로 여기서는 보이지 않습니다 |
-
-`@EntityScan` 과 `@EnableJpaRepositories` 의 `basePackages` 는 **문자열을 받습니다.** 컴파일러 입장에서는 일반 문자열과 다를 것이 없으므로, 해당 패키지가 실제로 없어도 컴파일과 기동이 정상적으로 이루어집니다. 런타임에 스캔했을 때 아무것도 찾지 못하고 끝날 뿐입니다.
+> **가입 후 자동 로그인은 없습니다.** 로그인 화면으로 보냅니다.
+> 비밀번호 상한이 72바이트인 것은 BCrypt 제약입니다. 한글은 한 글자가 3바이트라
+> `@MaxBytes(72)` 검증을 따로 둡니다.
+
+<br><br>
 
 ---
 
-## 2. 로컬 실행 환경
+### 3-3. 로그인 · 갱신 · 로그아웃
 
-### 2-1. 무엇이 어디서 도는가
-
-로컬에서는 인프라와 플랫폼을 Docker Compose로 띄우고, **지금 작업 중인 도메인 서비스만 IntelliJ에서 직접 실행합니다.** 도메인 서비스를 전부 컨테이너로 올리면 메모리 부족이 발생 할 수 있고, 코드를 고칠 때마다 이미지를 다시 만들어야 해 개발 속도가 크게 떨어집니다.
-
-| 어디서 도는가 | 무엇이 |
-|---|---|
-| AWS EC2 (팀 공용) | PostgreSQL 하나 |
-| 내 PC · Docker Compose | Kafka, Redis, 관측 스택, nginx, gateway, config, eureka |
-| 내 PC · IntelliJ | 지금 작업 중인 서비스 1~3개 |
-
-PostgreSQL만 공용으로 두는 이유는 수집한 데이터를 함께 쓰기 위해서입니다. 수집 API에 하루 호출 제한이 있어 데이터를 채우는 데 여러 날이 걸리고, 추출 배치는 GPU가 필요해 각자 재현할 수 없습니다.
-
-Kafka를 각자 로컬에 두는 이유는 반대입니다. 공용으로 쓰면 한 사람이 발행한 이벤트를 다른 사람의 컨슈머가 가져가 버려 서로의 테스트가 섞입니다.
-
-### 2-2. Compose 프로파일
-
-| 프로파일 | 포함 | 언제 켜는가 | 필수 |
-|---|---|---|---|
-| `infra` | Kafka, Redis | 거의 항상 | **필수** |
-| `platform` | gateway, eureka, config | 설정을 받고 게이트웨이를 거친 호출을 확인할 때 | **필수** |
-| `tools` | Kafka UI | 토픽에 메시지가 실제로 실렸는지 확인할 때 | 권장 |
-| `observability` | Prometheus, Grafana, Loki, Zipkin | 로그·메트릭·추적을 볼 때 | 선택 |
-| `db` | PostgreSQL | 공용 인스턴스를 쓸 수 없을 때만 | 선택 |
-| `edge` | nginx | 프론트엔드와 함께 확인할 때 | 선택 |
-| `pipeline` | ingest, extract | 수집·추출 배치를 돌릴 때만 | 선택 |
-| `app` | 도메인 서비스 전체 | 배포 검증 때만 | 선택 |
-
-`infra` 와 `platform` 이 필수인 이유는 **`platform` 이 빠지면 config-server가 없어 이 서비스가 데이터베이스 주소와 포트를 받지 못하고 기동에 실패하기 때문**입니다. 증상이 "포트가 8080으로 뜨고 datasource를 만들지 못함"으로 나타나 원인이 프로파일이라는 것이 드러나지 않습니다.
-
-기본 조합은 `infra,platform,tools` 이며 `infra` 저장소의 `.env` 에 지정되어 있습니다. 그 파일은 커밋되지 않으므로 각자 자기 환경에 맞게 바꿔도 됩니다. 조합별 안내와 메모리 배분은 `infra` 저장소의 README 3절에 있습니다.
-
-```bash
-# infra 레포의 .env 에 평소 조합이 지정되어 있어 옵션 없이 뜹니다
-docker compose up -d
-
-# 다른 조합이 필요할 때
-docker compose --profile db up -d
-
-# 내리기
-docker compose down
-```
-
-**`db` 프로파일은 평소에 켜지 않습니다.** PostgreSQL 은 공용 인스턴스를 쓰며, 로컬 인스턴스가 함께 떠 있으면 어느 쪽에 연결되었는지 헷갈립니다. `db` 로 띄운 컨테이너는 `docker compose down` 만으로는 내려가지 않으므로 `--profile db down` 을 사용합니다.
-
-**빌드할 때 쓰는 데이터베이스는 이 프로파일과 무관합니다.** `./gradlew build` 가 도는 동안에는 테스트가 자기 PostgreSQL 컨테이너를 직접 띄웠다가 끝나면 지웁니다. 그래서 `db` 프로파일을 켜 두지 않아도 빌드가 통과하고, 켜 두더라도 테스트는 그쪽을 쓰지 않습니다. 두 가지가 모두 Docker 위에서 돌지만 띄우는 주체가 다릅니다.
-
-`infra` 와 `platform` 을 띄운 뒤 자기 서비스를 IntelliJ 에서 실행하면, 서비스가 유레카에 등록되고 게이트웨이를 통해 호출할 수 있게 됩니다. 다른 서비스를 호출해야 한다면 그 서비스도 IntelliJ 에서 함께 띄웁니다.
-
-Compose 파일은 이 레포가 아니라 infra 레포에 있습니다. Redis 와 Kafka 는 사람당 하나만 떠 있어야 하므로 서비스 레포마다 두지 않습니다.
-
-### 2-3. 포트 배정
-
-포트가 겹치면 뒤에 뜬 서비스가 기동에 실패합니다. 아래 배정을 따릅니다.
-
-**플랫폼**
-
-| | 포트 |
-|---|---|
-| nginx | 80 |
-| gateway | 8080 |
-| eureka | 8761 |
-| config | 8888 |
-| 프론트엔드 (Vite) | 5173 |
-
-**도메인 서비스**
-
-| 서비스 | 포트 | | 서비스 | 포트 |
-|---|---|---|---|---|
-| auth | 8081 | | extract | 8089 |
-| user | 8082 | | congestion | 8090 |
-| pet | 8083 | | route | 8091 |
-| place | 8084 | | report | 8092 |
-| policy | 8085 | | notification | 8093 |
-| verdict | 8086 | | review | 8094 |
-| search | 8087 | | **template** | **8095** |
-| ingest | 8088 | | | |
-
-`template-service` 8095 는 이 저장소를 그대로 띄워 확인할 때 쓰는 자리입니다. 배포 대상이 아니며 config 저장소에 `template-service.yml` 이 있습니다.
-
-**인프라**
-
-Redis 6379 / Kafka 9092 · **29092** / Kafka UI 9000 / Prometheus 9090 / Grafana 3000 / Loki 3100 / Zipkin 9411 / PostgreSQL 5432(공용 인스턴스)
-
-**Kafka 는 29092 로 접속합니다.** 9092 는 컨테이너끼리 쓰는 주소여서, 호스트에서 붙으면 브로커가 되돌려주는 `kafka:9092` 를 해석하지 못해 연결에 실패합니다.
-
-프론트엔드를 3000 이 아니라 5173 에 두는 이유는 Grafana 가 3000 을 쓰기 때문입니다.
-
-배포 환경에서 인스턴스를 여러 개 띄우는 서비스는 **기본 포트 + 100 단위**로 배정합니다. verdict 는 8086·8186·8286, search 는 8087·8187, gateway 는 8080·8180 입니다. 로컬에서는 인스턴스가 하나씩이므로 기본 포트만 사용합니다.
-
-### 2-4. 메모리 주의
-
-메모리 16GB를 기준으로 컨테이너마다 메모리 상한을 걸어두었고, JVM을 쓰는 컨테이너에는 힙 상한을 함께 지정했습니다.
-
-**힙 상한을 지정하지 않으면 컨테이너가 아무 로그도 남기지 않고 종료됩니다.** JVM은 컨테이너에 걸린 상한과 무관하게 물리 메모리의 일정 비율까지 힙을 늘리려 하기 때문에, 컨테이너 상한을 넘는 순간 강제 종료됩니다. 원인을 추적하기 어려운 형태로 죽으므로 `-XX:MaxRAMPercentage`로 컨테이너 상한 대비 비율을 지정합니다.
-
-Apple Silicon 맥에서는 arm64 이미지가 있는지 확인합니다. Kafka는 arm64를 지원하는 공식 이미지를 사용합니다.
-
-### 2-5. 공용 DB에 연결하기
-
-PostgreSQL 인스턴스는 하나지만 그 안에 서비스별 DB와 전용 계정이 나뉘어 있습니다. 각 계정은 **자기 DB에만 접속할 수 있습니다.** 다른 서비스의 DB에 붙으려 하면 거부되는데, 이는 설정 오류가 아니라 의도된 격리입니다.
-
-**접속 정보는 서비스 저장소가 아니라 config 저장소에 있습니다.** 어디에 무엇이 있는지는 이렇습니다.
+**로그인**
 
 ```
-config/application-local.yml    app.datasource.host          ${DB_HOST}
-config/<서비스명>.yml            spring.datasource.url        jdbc:postgresql://${app.datasource.host}:5432/place_db
-                                spring.datasource.username   place_svc
-config/application.yml          spring.datasource.password   ${SERVICE_DB_PASSWORD}
+POST /login  {email, password}
+        │
+        ├──▶  이메일로 계정 조회
+        │       없음                   ──▶  401 LOGIN_FAILED
+        │       탈퇴함                 ──▶  403 ACCOUNT_WITHDRAWN
+        │       소셜 계정 (비밀번호 없음)  ──▶  401 LOGIN_FAILED   ← 소셜인지 안 알려 줌
+        │
+        ├──▶  비밀번호 대조            BCrypt.matches
+        │       틀림                   ──▶  401 LOGIN_FAILED   ← 이메일 없음과 같은 코드
+        │
+        ├──▶  토큰 2개 발급            access (typ=access, 30분) · refresh (typ=refresh, 14일)
+        ├──▶  Redis                   refresh:{jti} = accountId   TTL 14일   (커밋 뒤에)
+        ├──▶  refresh_token_log       1행  login_id 새로 · token_id = jti
+        ├──▶  account.last_login_at   갱신
+        │
+        ▼
+200 OK  +  Set-Cookie 2개  +  {accountId, email, role, authProvider}
 ```
 
-주소를 한 곳(`app.datasource.host`)에만 적고 서비스별 파일이 그것을 참조하는 이유는, **장애로 데이터베이스를 승격했을 때 그 한 줄만 고치면 모든 서비스가 따라오기 때문**입니다. 서비스마다 전체 주소를 적어 두면 열네 곳을 고쳐야 합니다.
-
-주소와 비밀번호는 팀 내부에서 전달받아 환경 변수로 넣습니다. **어느 설정 파일에도 값을 직접 적지 않습니다.**
-
-```
-# .env  (Docker Compose 가 읽습니다)
-DB_HOST=<전달받은 주소>
-SERVICE_DB_PASSWORD=<전달받은 비밀번호>
+```http
+POST /api/v1/auth/login
+{ "email": "me@example.com", "password": "test1234" }
 ```
 
-**`SERVICE_DB_PASSWORD` 는 infra 저장소의 `.env` 에 넣은 값과 같아야 합니다.** 계정을 만들 때 쓰는 값과 접속할 때 쓰는 값이 같은 것이므로 이름도 같게 두었습니다.
-
-주소를 환경 변수로 두는 이유는 EC2 를 재생성하면 주소가 바뀌기 때문입니다. 각자 `.env` 한 줄만 고치면 되고 저장소를 손댈 일이 없습니다.
-
-접속하려면 **본인의 공인 IP 가 보안그룹에 등록되어 있어야 합니다.** 인터넷 회선이 바뀌거나 공인 IP 가 갱신되면 다시 등록해야 하므로, 접속이 갑자기 안 될 때 이 부분을 먼저 확인합니다.
-
-`ddl-auto`는 반드시 `validate`로 둡니다. `update`나 `create`로 두면 애플리케이션이 공용 DB의 스키마를 마음대로 바꾸거나 데이터를 지웁니다. 수집에 여러 날이 걸린 데이터가 사라질 수 있습니다.
-
-### 2-6. Flyway는 공용 DB를 바꿉니다
-
-스키마는 Flyway 스크립트로 관리합니다. 그런데 DB가 공용이므로, **내가 실행한 마이그레이션이 그대로 팀원 환경에도 반영됩니다.**
-
-- 새 마이그레이션 스크립트를 추가했다면 팀원에게 알립니다
-- 이미 적용된 스크립트 파일은 고치지 않습니다. 내용이 바뀌면 체크섬이 달라져 다음 기동이 실패합니다. 고쳐야 한다면 새 번호로 스크립트를 하나 더 만듭니다
-- 서비스별 스크립트는 `V20`부터 시작합니다. `V1`부터 `V19`는 공통 모듈이 사용합니다
-
-### 2-7. 빌드할 때 뜨는 데이터베이스
-
-`./gradlew build` 를 돌리면 **PostgreSQL 컨테이너가 하나 떴다가 사라집니다.** 테스트가 직접 띄우는 것이며, 위에서 설명한 공용 DB나 `db` 프로파일과는 아무 관계가 없습니다.
-
-| | 개발할 때 | 빌드할 때 |
-|---|---|---|
-| 무엇이 쓰나 | 개발 도구에서 띄운 서비스 | `contextLoads()` |
-| 데이터베이스 | 공용 PostgreSQL | 테스트가 띄운 컨테이너 |
-| 누가 준비하나 | 사람이 미리 세워 둠 | 테스트가 알아서 |
-| 데이터 | 남습니다 | 매번 사라집니다 |
-| 사는 동안 | 개발하는 내내 | 몇 초 |
-
-#### 왜 이렇게 하는가
-
-`contextLoads()` 는 애플리케이션을 통째로 한 번 띄워 **빈 배선이 깨지지 않았는지** 확인하는 검사입니다. 그런데 애플리케이션이 뜨려면 `DataSource` 가 필요하고, 그 주소는 설정 서버에서 내려옵니다.
-
-`spring.config.import` 에 `optional:` 이 붙어 있어 **설정 서버가 없어도 조용히 넘어간 뒤 `DataSource` 를 만들다 실패합니다.** 그대로 두면 이 검사가 설정 서버 기동 여부에 따라 되다 말다 하므로 검사로서 의미가 없고, 설정 서버가 없는 CI에서는 항상 실패합니다.
-
-그래서 테스트가 외부에 기대지 않도록 데이터베이스를 스스로 준비합니다. Docker가 떠 있어야 하지만, 평소 개발에 컨테이너를 띄워 두므로 추가 조건은 아닙니다.
-
-#### 무엇이 검증되는가
-
-메모리 데이터베이스가 아니라 실제 PostgreSQL을 쓰는 이유입니다.
-
-- **Flyway 스크립트가 실제로 실행됩니다.** `V1`, `V2`, 그리고 이 서비스의 `V20` 까지 돌아갑니다
-- **엔티티와 스키마가 대조됩니다.** `ddl-auto` 가 `validate` 이므로 컬럼 이름이나 타입이 어긋나면 빌드가 실패합니다
-- 공통 모듈의 자동 설정 6개가 실제로 켜지는지도 함께 드러납니다
-
-#### 좌표 타입을 쓰는 서비스는 이미지를 바꿉니다
-
-기본값은 `postgres:17-alpine` 입니다. arm64를 지원해 Apple Silicon에서 에뮬레이션 없이 돕니다.
-
-**search, route, place 는 PostGIS가 필요하므로** `TemplateApplicationTests` 의 이미지 이름을 `postgis/postgis:17-3.5` 로 바꿉니다. 그 이미지는 amd64 전용이라 Apple Silicon에서는 Docker Desktop의 Rosetta를 켜야 합니다.
-
-#### 테스트 설정 파일은 main 쪽을 가립니다
-
-`src/test/resources/application.yml` 은 `src/main/resources/application.yml` 을 **덮어쓰는 것이 아니라 통째로 가립니다.** 클래스패스에서 `application.yml` 을 하나만 찾는데 테스트 리소스가 앞서기 때문입니다.
-
-그래서 main 쪽에 있던 값도 필요하면 다시 적어야 합니다. 지금 옮겨 적은 것은 둘입니다.
-
-| 값 | 빠뜨리면 |
-|---|---|
-| `spring.application.name` | 로그의 서비스 이름과 유레카 등록 이름이 `unknown` 이 됩니다 |
-| `spring.profiles.default` | 프로파일이 `local` 이 아니게 되어 **Loki 로 로그를 보내려다 실패하고, 테스트 출력이 연결 오류 스택트레이스로 뒤덮입니다** |
-
-나머지 넷(`spring.cloud.config.enabled`, `eureka.client.enabled`, `spring.flyway.locations`, `spring.jpa.hibernate.ddl-auto`)은 config 저장소 1계층의 사본입니다. **설정 서버를 껐으므로 1계층 값이 하나도 내려오지 않기 때문**이며, config 저장소에서 그 값을 바꾸면 이 파일도 함께 봅니다.
-
-#### 라이브러리 사용 시 주의 3가지
-
-Testcontainers 2.x 는 1.x와 여러 곳이 다릅니다. **인터넷 예제 대부분이 1.x 기준이므로 그대로 가져오면 걸립니다.**
-
-**하나 — 아티팩트 이름에 접두사가 붙습니다.** 2.0부터의 규칙이며, 접두사 없는 옛 이름은 1.x 버전까지만 존재합니다.
-
-```groovy
-// 1.x
-'org.testcontainers:postgresql'
-// 2.x
-'org.testcontainers:testcontainers-postgresql'
-```
-
-**둘 — 버전을 직접 적어야 합니다.** Spring Boot가 버전을 관리하는 것은 `spring-boot-testcontainers` 하나뿐이고, `testcontainers-bom` 에는 접두사가 붙은 이름들이 빠져 있어 가져와도 해결되지 않습니다. `gradle.properties` 의 `testcontainersVersion` 으로 지정하며, **전이로 들어오는 코어와 같은 값이어야 합니다.**
-
-```powershell
-./gradlew dependencies --configuration testCompileClasspath | Select-String "testcontainers"
-```
-
-**셋 — 컨테이너 클래스의 패키지가 바뀌었습니다.** 2.x 는 제네릭이 없는 `org.testcontainers.postgresql.PostgreSQLContainer` 입니다. 제네릭이 붙은 옛 클래스는 하위 호환용으로 남아 있고 사용이 권장되지 않습니다.
-
-```java
-// 옛 클래스 — 컴파일은 통과하지만 경고가 남습니다
-import org.testcontainers.containers.PostgreSQLContainer;
-static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
-
-// 현재 클래스
-import org.testcontainers.postgresql.PostgreSQLContainer;
-static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17-alpine");
-```
-
-**클래스 이름 뒤에 `<?>` 가 붙어 있으면 옛 클래스를 쓰고 있다는 뜻입니다.**
-
-이 경고는 Gradle 빌드 캐시에 가려집니다. 소스가 바뀌지 않으면 컴파일을 다시 하지 않아 경고도 찍히지 않으므로, 고친 뒤 확인할 때는 강제로 다시 컴파일합니다.
-
-```powershell
-./gradlew clean build --rerun-tasks
-```
+> **이메일이 없는 것과 비밀번호가 틀린 것을 같은 코드로 냅니다.** 나누면 응답만 보고
+> *"이 이메일은 가입돼 있다"* 를 알아낼 수 있습니다. 소셜 계정도 같은 이유로 숨깁니다.
+> **탈퇴한 계정만 알려 줍니다** — 안 알리면 비밀번호를 계속 다시 입력하게 됩니다.
 
 ---
 
-## 3. 공통 모듈 가져오기와 버전 올리기
+**갱신**
 
-공통 모듈은 GitHub Packages에 jar로 배포되어 있습니다. 각 서비스는 이를 의존성으로 당겨 씁니다.
+```
+POST /refresh   (refresh_token 쿠키만, 바디 없음)
+        │
+        ├──▶  토큰을 읽음              서명 · 만료 · typ=refresh
+        ├──▶  계정 확인               탈퇴했거나 iat < tokens_valid_from 이면 401
+        │
+        └──▶  Redis Lua 스크립트 (한 덩어리로)
+                GETDEL refresh:{옛jti}           옛 토큰을 소비
+                │
+                ├── 있음 ──▶  SET refresh:{새jti}              새 토큰 활성화
+                │             SET refreshgrace:{옛jti} 새토큰    30초 유예 항목
+                │             │
+                │             └──▶  옛 이력 행 revoked_at · 새 행 INSERT (login_id 물려받음)
+                │                   200 + Set-Cookie 2개
+                │
+                └── 없음 ──▶  refreshgrace:{옛jti} 가 있나
+                                │
+                                ├── 있음 ──▶  30초 안의 경합 (탭 두 개)   →  그 토큰을 그대로 돌려줌  200
+                                │
+                                └── 없음 ──▶  유예 밖의 재사용 = 복제       →  tokens_valid_from 을 지금으로
+                                                                              그 계정 토큰 전부 폐기  401
+```
 
-### 3-1. 인증 환경변수 설정
+```http
+POST /api/v1/auth/refresh
+(바디 없음)
+```
 
-GitHub Packages는 공개 저장소라도 내려받을 때 인증을 요구합니다. 따라서 **빌드하기 전에 환경변수 두 개를 설정해야 합니다.** 설정하지 않으면 빌드가 401로 실패하는데, 오류 메시지에 원인이 드러나지 않아 찾는 데 시간이 걸립니다.
-
-| 환경변수 | 값 |
+| 응답 | 언제 |
 |---|---|
-| `GPR_USER` | 본인의 GitHub 사용자명 |
-| `GPR_TOKEN` | GitHub Personal Access Token |
+| 200 + Set-Cookie 2개, `data: null` | 갱신됨 |
+| 401 `INVALID_REFRESH_TOKEN` | 쿠키 없음 · 만료 · 서명 오류 · 복제 탐지 · 폐기됨 — **전부 한 코드** |
 
-토큰 권한은 내려받기만 한다면 `read:packages` 하나면 충분합니다. 공통 모듈을 배포하는 담당자만 `write:packages`를 추가로 부여받습니다.
-
-토큰은 절대 `build.gradle` 이나 레포 안 파일에 직접 적지 않습니다. 커밋에 함께 올라갑니다.
-
-**환경변수가 없으면 빌드가 실패합니다.** 공통 모듈 의존성이 이미 선언되어 있어 내려받기를 시도하기 때문이며, 인증에 실패하면 `Received status code 401` 로 나타납니다. 원인이 토큰이라는 것이 메시지에 드러나지 않으므로 이 절을 먼저 확인합니다.
-
-### 3-2. build.gradle에서 고치는 부분
-
-버전은 `gradle.properties`에 한 줄로 두고, `build.gradle`이 그 값을 참조합니다.
-
-```properties
-# gradle.properties
-commonVersion=0.0.4
-
-# 라이브러리 버전도 같은 곳에서 관리합니다
-querydslVersion=7.6
-springdocVersion=3.1.0
-```
-
-```groovy
-// build.gradle
-repositories {
-    mavenCentral()
-    maven {
-        name = "GitHubPackages"
-        url = uri("https://maven.pkg.github.com/paw-trail/common")
-        credentials {
-            username = System.getenv("GPR_USER")
-            password = System.getenv("GPR_TOKEN")
-        }
-    }
-}
-
-dependencies {
-    implementation "com.pawtrail:common:${commonVersion}"
-}
-```
-
-버전을 `build.gradle`에 직접 적지 않고 `gradle.properties`로 뺀 이유는, 고쳐야 할 자리를 파일 하나로 고정하기 위해서입니다. 레포가 여러 개이므로 버전을 올릴 때 어디를 봐야 하는지가 매번 같아야 합니다.
-
-### 3-3. 공통 모듈 버전을 올리는 절차
-
-1. 공통 모듈 레포에서 `version`을 올리고 GitHub Packages에 배포합니다
-2. 이 서비스 레포의 `gradle.properties`에서 `commonVersion` 값을 새 버전으로 고칩니다
-3. Gradle을 새로 고칩니다
-
-공통 모듈은 릴리스 버전으로 고정해 사용합니다. 즉 버전을 올리지 않으면 계속 예전 버전으로 빌드됩니다. 컴파일은 정상적으로 되기 때문에 알아채기 어려우므로, **공통 모듈이 변경되었다는 공지를 받으면 이 값부터 확인합니다.**
-
-### 3-4. 로깅과 프로파일
-
-템플릿에는 `src/main/resources/logback-spring.xml` 이 들어 있습니다. 콘솔 출력과 Loki 전송을 함께 설정하며, 서비스마다 고칠 것은 없습니다.
-
-Loki 전송용 appender 정의는 공통 모듈 jar 안의 `logback-loki-appender.xml` 에 있고, 템플릿의 `logback-spring.xml` 이 그것을 `include` 해서 사용합니다. 파일을 나눈 이유는 `logback-spring.xml` 이라는 이름이 클래스패스에서 하나만 읽히기 때문입니다. 서비스 레포가 jar 보다 앞서므로 공통 모듈에 같은 이름을 두면 무시됩니다.
-
-**`<springProfile>` 은 최상위에만 둘 수 있습니다.** `<root>`·`<appender>`·`<logger>` 안에 넣으면 아래 경고가 나고 동작이 보장되지 않습니다.
-
-```
-<springProfile> elements cannot be nested within an <appender>, <logger> or <root> element
-```
-
-logback 은 `<springProfile>` 을 먼저 처리하는데 `<root>` 안쪽은 나중에 처리하므로 평가 시점이 어긋나기 때문입니다. 그래서 템플릿은 **프로파일마다 `<root>` 를 따로 두는 형태**로 되어 있습니다. `local` 에서는 appender 정의를 `include` 하지도 않아 아예 만들어지지 않습니다.
-
-파일 이름은 반드시 `logback-spring.xml` 이어야 합니다. `logback.xml` 로 두면 스프링 확장이 걸리지 않아 `<springProfile>` 과 `<springProperty>` 가 **오류 없이 조용히 무시됩니다.**
-
-**전송 여부는 프로파일이 결정합니다.**
-
-| 프로파일 | 언제 | Loki 전송 |
-|---|---|---|
-| `local` | IntelliJ 에서 실행 | 하지 않음 |
-| `dev` | 컨테이너에서 실행 | 함 |
-
-`application.yml` 에 `spring.profiles.default: local` 이 들어 있어, 아무것도 지정하지 않으면 `local` 로 동작합니다. `active` 가 아니라 `default` 인 것이 중요합니다. `default` 는 아무도 지정하지 않았을 때만 적용되므로, 컨테이너에서 `SPRING_PROFILES_ACTIVE=dev` 를 주면 그쪽이 우선합니다.
-
-IntelliJ 에서 Loki 전송까지 확인하고 싶다면 실행 구성의 환경 변수에 다음을 추가합니다.
-
-```
-SPRING_PROFILES_ACTIVE=dev
-```
-
-기동 로그 첫머리의 `The following 1 profile is active` 줄로 어느 쪽인지 확인할 수 있습니다.
-
-메트릭과 추적은 프로파일과 무관하게 항상 전송됩니다. Prometheus 는 서비스의 `/actuator/prometheus` 를 직접 수집하고, 추적은 애플리케이션이 Zipkin 으로 보냅니다.
+> `data` 가 비어 있는 것은 **프론트가 이것을 부르는 자리가 401 인터셉터 안**이라
+> 새 쿠키만 필요하기 때문입니다.
+> 401 이 한 코드인 것은 **어느 경우든 프론트가 할 일이 로그인 화면으로 보내는 것 하나**라서입니다.
 
 ---
 
-## 4. 설정값을 어디에 두는가
+**로테이션과 유예 30초가 왜 있나**
 
-설정값은 성격에 따라 네 곳으로 나뉩니다. 읽히는 시점과 바꿀 때 드는 비용이 서로 다르므로 섞어 쓰지 않습니다.
-
-| 두는 곳 | 언제 읽히는가 | 무엇을 두는가 | 바꾸려면 |
-|---|---|---|---|
-| 레포 안 `gradle.properties` | 빌드할 때 (Gradle) | 빌드에만 쓰이는 값 | 다시 빌드 |
-| 레포 안 `application.yml` | 기동할 때 | **세 줄뿐입니다** (아래 참고) | 재배포 |
-| **config 저장소** | 기동·갱신할 때 | 그 밖의 거의 모든 값 | **커밋만 하면 됩니다** |
-| 환경 변수 | 빌드·기동 시점 | 비밀값, 사람마다 다른 값 | 컨테이너 재시작 |
-
-**대부분의 값은 config 저장소에 있습니다.** 서비스 저장소의 `application.yml` 에는 세 줄만 남깁니다.
-
-```yaml
-spring:
-  application:
-    name: place-service
-  config:
-    import: "optional:configserver:http://${CONFIG_HOST:localhost}:8888"
-  profiles:
-    default: local
-```
-
-**config 저장소로 옮긴 값을 서비스 저장소에 남겨 두지 않습니다.** 같은 키가 두 곳에 있으면 어느 쪽이 이기는지 매번 확인해야 합니다.
-
-### 4-1. config 저장소의 4계층
-
-값은 네 파일에 나뉘어 있고, **계층 번호가 곧 세기입니다. 숫자가 큰 쪽이 이깁니다.**
-
-| 계층 | 파일 | 적용 범위 | 예 |
-|:---:|---|---|---|
-| 1 | `application.yml` | 모든 서비스 · 모든 환경 | `ddl-auto`, Flyway `locations`, Kafka 직렬화기, 액추에이터 노출 |
-| 2 | `{서비스명}.yml` | 해당 서비스 · 모든 환경 | 포트, 데이터베이스 이름과 계정, outbox relay 스위치 |
-| 3 | `application-{env}.yml` | 모든 서비스 · 해당 환경만 | 데이터베이스 호스트, Kafka · Redis · 유레카 · Loki · Zipkin 주소 |
-| 4 | `{서비스명}-{env}.yml` | 해당 서비스 · 해당 환경만 | 되도록 비워 둡니다 |
-
-**"구체적인 파일이 이긴다"가 아닙니다.** 규칙은 두 겹입니다.
-
-1. 프로파일이 붙은 파일이 안 붙은 파일을 이깁니다
-2. 같은 조건 안에서는 서비스별 파일이 공통 파일을 이깁니다
-
-그래서 **3계층이 2계층을 이깁니다.** 환경별 공통값을 특정 서비스만 다르게 하고 싶다면 2계층이 아니라 **4계층에 적어야 합니다.** 2계층에 적으면 덮여서 반영되지 않습니다.
-
-값을 추가할 때는 **"서비스마다 다른가 / 환경마다 다른가"** 두 가지만 판단합니다. 애매하면 번호가 작은 계층에 둡니다. 나중에 큰 번호에서 덮어쓰는 것이 반대보다 쉽습니다.
-
-### 4-2. 환경 프로파일
-
-프로파일은 3개이며 축의 기준은 **어디에서 실행되는가** 입니다.
-
-| 프로파일 | 실행 위치 |
+| 상황 | 처리 |
 |---|---|
-| `local` | IntelliJ에서 직접 실행 |
-| `dev` | 로컬 `docker compose` 의 `app` 프로파일 |
-| `prod` | AWS EC2 |
+| 정상 갱신 | 옛 토큰을 소비하고 새 토큰을 줌. **옛 토큰은 못 씀** |
+| 탭 두 개가 동시에 갱신 | 한쪽이 이기고, 진 쪽은 30초 안이면 **이긴 쪽 토큰을 그대로 받음** |
+| 30초 지난 옛 토큰이 또 들어옴 | **복제로 판단.** 누가 토큰을 훔쳐 쓴 것이므로 그 계정 토큰을 전부 폐기 |
 
-지정하지 않으면 `local` 로 동작하며 Loki 전송이 꺼집니다. 컨테이너에서는 `SPRING_PROFILES_ACTIVE=dev` 가 이깁니다.
-
-**프로파일 이름에 하이픈을 쓰지 않습니다.** 하이픈이 있으면 설정 서버가 서비스명과 프로파일을 가르지 못해 설정을 받아오지 못합니다.
-
-### 4-3. 환경변수를 어디에 넣는가
-
-환경 변수는 넣는 위치가 실행 방법에 따라 다릅니다. 여기서 자주 막히므로 세 경우를 구분합니다.
-
-| 실행 방법 | 어디에 넣는가 |
-|---|---|
-| Docker Compose로 컨테이너를 띄울 때 | 프로젝트 루트의 `.env` 파일. Compose가 자동으로 읽습니다 |
-| IntelliJ에서 서비스를 직접 실행할 때 | 실행 구성(Run/Debug Configurations)의 Environment variables 칸 |
-| Gradle 빌드(공통 모듈 내려받기) | OS 환경변수. IntelliJ 실행 구성에 넣어도 Gradle 빌드에는 적용되지 않습니다 |
-
-**IntelliJ에서 직접 실행하는 서비스는 `.env` 파일을 읽지 않습니다.** `.env` 는 Docker Compose 가 읽는 파일이므로, IntelliJ 로 띄우는 서비스에 `SERVICE_DB_PASSWORD` 가 필요하다면 실행 구성에 직접 넣어야 합니다.
-
-레포에 들어 있는 `.env.example` 을 복사해 `.env` 를 만들고 값을 채웁니다.
-
-```bash
-cp .env.example .env
-```
-
-`.env` 는 커밋하지 않습니다. `.gitignore` 에 이미 포함되어 있습니다.
-
-### 4-4. 서비스가 사용하는 주요 설정값
-
-| 키 | 두는 곳 | 값 | 무엇을 하는가 |
-|---|---|---|---|
-| `commonVersion` | 레포 안 `gradle.properties` | 예: `0.0.4` | 공통 모듈 버전 |
-| `GPR_USER` / `GPR_TOKEN` | OS 환경변수 | GitHub 계정·토큰 | 공통 모듈 내려받기 |
-| `CONFIG_HOST` | 환경변수 | 기본값 `localhost` | 설정 서버 주소. 컨테이너와 AWS 에서만 지정합니다 |
-| `DB_HOST` | 환경변수 (`.env`) | 개발용 PostgreSQL 주소 | config 저장소의 `app.datasource.host` 가 이 값을 참조합니다 |
-| `SERVICE_DB_PASSWORD` | 환경변수 (`.env`) | 서비스 계정 비밀번호 | **infra 저장소의 `.env` 에 넣은 값과 같아야 합니다.** 절대 커밋하지 않습니다 |
-| `SPRING_PROFILES_ACTIVE` | 환경변수 (실행 구성 또는 Compose) | `dev` | 지정하지 않으면 `local` 로 동작하며 Loki 전송이 꺼집니다 |
-| `spring.datasource.url` | config 2계층 | `jdbc:postgresql://${app.datasource.host}:5432/<서비스>_db` | 호스트는 3계층에서 참조해 옵니다 |
-| `spring.datasource.username` | config 2계층 | `<서비스>_svc` | 자기 DB에만 접속할 수 있는 계정입니다. `_user` 가 아닙니다 |
-| `app.datasource.host` | config 3계층 | 환경별 주소 | **데이터베이스를 승격할 때 고치는 자리가 이 한 줄입니다** |
-| `app.auditor.system-name` | config 1계층 (기본 `SYSTEM`) | 배치만 2계층에서 덮음 | 인증 없이 도는 배치가 감사 컬럼에 남길 이름입니다. 없으면 배치의 INSERT 가 실패합니다 |
-| `app.outbox.relay.enabled` | config 2계층 | 발행 서비스의 한 인스턴스만 `true` | 미발행 이벤트를 회수하는 스케줄러입니다 |
-| `app.logging.loki.url` | config 3계층 | 환경별 주소 | logback 이 읽는 전송 주소입니다 |
-| `spring.jpa.hibernate.ddl-auto` | config 1계층 | `validate` | 스키마는 Flyway가 관리하므로 애플리케이션은 검증만 합니다 |
-| 외부 API 키 · OAuth 시크릿 | 환경변수 | 제공자 콘솔에서 발급 | 설정 파일에 적지 않습니다 |
-| JWT 서명 키 | **개인키는 환경변수, 공개키는 config 저장소** | RS256 | ★아래 설명을 반드시 읽습니다 |
-
-### 4-5. 비밀값은 config 저장소에 넣지 않습니다
-
-**`paw-trail/config` 는 공개 저장소입니다.** 비밀번호·개인키·시크릿은 어느 계층에도 넣지 않고, 자리만 `${환경변수}` 형태로 남깁니다.
-
-```yaml
-spring:
-  datasource:
-    password: ${SERVICE_DB_PASSWORD}
-```
-
-**기본값을 함께 적지 않습니다.** `${SERVICE_DB_PASSWORD:1234}` 처럼 쓰면 환경 변수를 빠뜨려도 접속이 되어 버려 누락이 영영 드러나지 않습니다. 환경 변수가 없으면 기동이 실패하는 편이 낫습니다.
-
-**RS256 키는 개인키와 공개키를 다르게 다룹니다.**
-
-- **개인키**(auth 가 토큰에 서명) — 환경 변수. 유출되면 누구나 유효한 토큰을 만들 수 있습니다
-- **공개키**(게이트웨이가 서명 검증) — config 저장소에 둡니다. 검증에만 쓰이므로 공개되어도 무해합니다
-
-**한 번 커밋한 값은 지워도 이력에 남습니다.** 되돌리는 것으로 끝나지 않으며 해당 키를 새로 발급해야 합니다.
-
-### 4-6. 값을 바꾸면 언제 반영되는가
-
-| 바꾼 것 | 필요한 작업 |
-|---|---|
-| config 저장소의 값 | `main` 에 커밋하면 끝입니다. 설정 서버는 다시 띄우지 않아도 됩니다 |
-| 이미 떠 있는 서비스에 반영 | `POST /actuator/refresh` 또는 재기동 |
-| 레포 안 `application.yml` | 재배포 |
-| 환경 변수 | 컨테이너 재시작 |
-
-`refresh` 는 데이터베이스 커넥션 풀까지 다시 만듭니다. 그래서 데이터베이스를 승격했을 때 주소만 바꾸고 재배포 없이 전환할 수 있습니다. 이는 config 1계층의 아래 두 줄에 달려 있으므로 지우지 않습니다.
-
-```yaml
-spring:
-  cloud:
-    refresh:
-      extra-refreshable: javax.sql.DataSource,com.zaxxer.hikari.HikariDataSource
-      never-refreshable: ""
-```
-
-없으면 프로퍼티만 다시 바인딩되고 **커넥션 풀은 옛 주소를 그대로 물고 있습니다.** `refresh` 응답이 정상이고 바뀐 키가 나와도 그렇습니다.
-
-### 4-7. 설정이 제대로 내려오는지 확인하기
-
-```
-http://localhost:8888/<서비스명>/local
-```
-
-응답의 `propertySources` 배열이 **어느 계층 파일에서 온 값인지까지 보여 주며, 배열 앞이 우선순위가 높은 쪽**입니다.
-
-**`.yml` · `.properties` · `.json` 주소는 쓸 수 없습니다.** 설정 서버가 그 주소에서 서비스명과 프로파일을 하이픈으로 가르는데, 우리 서비스명은 모두 `place-service` 처럼 하이픈을 포함하고 있어 400 이 납니다.
-
-포트가 8080 으로 뜬다면 2계층 파일을 못 찾은 것입니다. 파일명이 `spring.application.name` 과 정확히 같은지 확인합니다. 다르면 **오류 없이 그 계층만 빠진 채 내려갑니다.**
-
-## 5. 4계층 — 왜 이렇게 나누는가
-
-모든 서비스는 `presentation / application / domain / infrastructure` 4계층으로 나뉩니다.
-
-| 계층 | 맡는 일 | 이 계층과 관련 없는 역할 |
-|---|---|---|
-| **presentation** | 요청을 받아 형식을 확인하고, 결과를 응답 형태로 돌려줍니다 | 무엇이 옳은지 판단하는 일 (예시: 조건을 따져 동반 가능 여부를 계산하거나, DB를 직접 조회하는 코드) |
-| **application** | 어떤 일을 어떤 순서로 할지 조율하고 결과를 조립합니다. 판단 기준 자체는 갖지 않습니다 | 판단 기준을 직접 갖는 일 (예시: 판정 규칙을 여기서 계산하거나, SQL을 작성하는 코드) |
-| **domain** | 이 서비스에 어떤 개념과 규칙이 필요한지를 정의합니다. 바깥에서 가져와야 하는 것은 인터페이스로 선언만 해둡니다 | 특정 기술을 다루는 일 (예시: JPA로 조회하거나, 카프카로 발행하거나, HTTP를 호출하는 코드) |
-| **infrastructure** | domain이 정의해둔 인터페이스를, 실제로 사용하는 기술 스택에 맞춰 구현합니다 | 판단 기준을 갖는 일 (예시: 어떤 조건이면 동반 가능인지를 여기서 정하는 코드) |
-
-### 핵심 원칙
-
-> **인터페이스는 `domain`에 선언하고, 구현은 `infrastructure`에 둡니다.**
-
-예를 들어 verdict가 policy 서비스를 호출해야 한다면 다음과 같이 나눕니다.
-
-- `domain/provider/PolicyProvider.java` — "정책을 가져다주는 무언가"라는 **약속**만 선언합니다
-- `infrastructure/provider/PolicyProviderImpl.java` — 실제로 HTTP를 호출하는 **구현**입니다
-
-이렇게 하면 의존 방향이 항상 `domain`을 향합니다. 그 결과 두 가지를 얻습니다.
-
-- **`RuleEngine`을 테스트할 때 다른 서비스를 띄우지 않아도 됩니다.** 가짜 `PolicyProvider`를 넣으면 됩니다
-- **통신 방식이 바뀌어도 `domain` 코드는 바뀌지 않습니다.** 구현체만 교체하면 됩니다
+> 유예가 없으면 탭 두 개만 열어도 한쪽이 강제 로그아웃됩니다.
+> 유예가 무한이면 훔친 토큰을 영원히 씁니다. **30초는 업계 기본값(Okta · Cognito)입니다.**
 
 ---
 
-## 6. 공통 모듈 (`com.pawtrail.common`)
+**로그아웃**
 
-모든 서비스가 의존성으로 당겨쓰는 라이브러리입니다. GitHub Packages로 배포합니다.
-
-- **넣는 것** — 기술적 관심사이면서 거의 바뀌지 않는 것
-- **넣지 않는 것** — 도메인 지식, 이벤트 payload DTO, 도메인 엔티티
-
-> 공통 모듈을 고치면 이를 사용하는 모든 서비스가 버전을 올려야 합니다. 따라서 "여러 곳에서 쓰인다"만으로는 부족하고 "앞으로 거의 바뀌지 않는다"까지 만족해야 넣습니다.
-
-### 자동 설정 6개
-
-`config/` 패키지의 6개 클래스가 `AutoConfiguration.imports` 에 등록되어 있습니다. 서비스는 의존성만 추가하면 조건에 맞는 것이 올라옵니다.
-
-| 클래스 | 켜지는 조건 | 등록하는 Bean |
-|---|---|---|
-| `CommonWebAutoConfiguration` | 서블릿 웹 + spring-webmvc | `GlobalExceptionHandler`, `TraceIdResponseAdvice` |
-| `CommonSecurityAutoConfiguration` | 서블릿 웹 + spring-security | `SecurityFilterChain`(관리자 경로 보호 포함), `CustomSecurityExceptionHandler` |
-| `CommonJpaAutoConfiguration` | spring-data-jpa | `AuditorProvider`, JPA Auditing 활성화 |
-| `CommonMessagingAutoConfiguration` | spring-data-jpa + spring-kafka | `OutboxEventRecorder`, `OutboxPublisher`, `OutboxCommitListener`, `OutboxRelay`, `InboxProcessor` |
-| `CommonKafkaAutoConfiguration` | spring-kafka | `RecordMessageConverter`, `KafkaSecurityInterceptor`, `DefaultErrorHandler` |
-| `CommonAsyncAutoConfiguration` | 없음 | `@EnableAsync` |
-
-조건 판단에 `jakarta.persistence.EntityManager` 가 아니라 `org.springframework.data.jpa.repository.JpaRepository` 를 쓰는 이유는, `hibernate-spatial` 이 `hibernate-core` 를 거쳐 `jakarta.persistence-api` 를 전이로 끌고 오기 때문입니다. JPA 스타터를 지운 무상태 서비스에서도 `EntityManager` 는 클래스패스에 남아 조건이 참이 되어버립니다.
-
-모든 Bean 에 `@ConditionalOnMissingBean` 이 붙어 있으므로, 서비스가 같은 타입의 Bean 을 직접 정의하면 공통 모듈 쪽이 물러납니다. 로그인 경로를 열어야 하는 auth 서비스가 자체 `SecurityFilterChain` 을 정의하는 경우가 여기 해당합니다.
-
-### 패키지 구조
-
-```
-com.pawtrail.common
-│
-├── config/                                         자동 설정 6개. 조건과 Bean 정의가 모두 여기 모입니다.
-│   ├── CommonWebAutoConfiguration.java (class)     자동 설정 클래스는 컴포넌트 스캔에 걸리면 안 되는
-│   ├── CommonSecurityAutoConfiguration.java        특수한 부류라 한 폴더에 격리해 둡니다
-│   ├── CommonJpaAutoConfiguration.java
-│   ├── CommonMessagingAutoConfiguration.java
-│   ├── CommonKafkaAutoConfiguration.java
-│   └── CommonAsyncAutoConfiguration.java
-│
-├── entity/
-│   └── BaseEntity.java (abstract class)            모든 테이블이 상속하는 공통 컬럼 묶음입니다.
-│                                                   createdAt·createdBy, updatedAt·updatedBy,
-│                                                   deletedAt·deletedBy 를 가집니다. 소프트 딜리트를 쓰므로
-│                                                   실제 DELETE 를 하지 않고 deletedAt 에 시각을 기록합니다.
-│                                                   NULL 이면 살아있는 행입니다.
-│                                                   시각은 전부 LocalDateTime 이며 DB 컬럼은 timestamp 입니다
-│
-├── audit/
-│   └── AuditorProvider.java (class)                "지금 이 작업을 하는 주체가 누구인가"를 한 곳에서
-│                                                   알려줍니다. 삭제 시 deletedBy 에 넣을 값을 여기서 얻습니다.
-│                                                   생성·수정은 JPA 가 자동으로 채우는데 삭제만 수동이므로,
-│                                                   값의 출처가 갈리지 않도록 두는 장치입니다.
-│                                                   인증이 없으면 app.auditor.system-name 값을 씁니다
-│
-├── enums/
-│   └── Role.java (enum)                            USER / ADMIN. 게이트웨이가 X-User-Role 로 주입하는
-│                                                   값입니다
-│
-├── exception/
-│   ├── ErrorCode.java (interface)                  에러 코드가 가져야 할 모양만 정의합니다.
-│   │                                               getHttpStatus, getCode, getMessage 세 개이며
-│   │                                               각 서비스가 자기 enum 으로 구현합니다.
-│   │                                               getCode() 는 반드시 name() 을 그대로 반환합니다.
-│   │                                               상수 이름이 곧 응답 code 이자 API 계약인데
-│   │                                               규칙을 어겨도 컴파일러가 잡지 못합니다
-│   ├── CommonErrorCode.java (enum)                 모든 서비스에서 같은 뜻으로 쓰이는 에러만 담습니다.
-│   │                                               VALIDATION_FAILED(400)
-│   │                                               AUTHENTICATION_FAILED(401)
-│   │                                               ACCESS_DENIED(403)
-│   │                                               INTERNAL_ERROR(500)
-│   │                                               EXTERNAL_API_ERROR(502)
-│   ├── CustomException.java (class)                의도적으로 던지는 모든 예외입니다. ErrorCode 를 하나
-│   │                                               물고 있으며, 핸들러가 거기서 HTTP 상태와 메시지를 꺼냅니다.
-│   │                                               예외 클래스를 상태별로 나누지 않는 이유는, 상태값이 이미
-│   │                                               ErrorCode 에 있어 클래스가 두 번째 진실의 원천이 되면
-│   │                                               둘이 어긋나도 아무도 알아채지 못하기 때문입니다
-│   └── handler/
-│       └── GlobalExceptionHandler.java (class)
-│                                                   모든 예외를 잡아 응답 형식으로 바꾸는 곳입니다.
-│                                                   핸들러는 4개입니다.
-│                                                   (1) CustomException → ErrorCode 의 상태로 응답
-│                                                   (2) MethodArgumentNotValidException(@Valid 실패)
-│                                                       → 400 과 함께 필드별 오류 배열 반환
-│                                                   (3) MethodArgumentTypeMismatchException
-│                                                       (/places/abc 처럼 타입 불일치) → 400
-│                                                   (4) Exception → 500
-│                                                   401·403 은 여기로 오지 않습니다. 시큐리티 필터가
-│                                                   DispatcherServlet 앞에 있어 아래 핸들러가 처리합니다
-│
-├── message/                                        이벤트 발행·수신의 뼈대
-│   ├── DomainEvent.java (interface)                발행할 이벤트가 구현하는 계약입니다.
-│   │                                               getTopic, getAggregateType, getAggregateId 세 개이며
-│   │                                               셋 다 @JsonIgnore 라 payload 에는 나가지 않습니다.
-│   │                                               이벤트가 자기 라우팅 정보를 들고 다니므로 발행할 때
-│   │                                               토픽을 따로 넘기지 않습니다
-│   ├── EventEnvelope.java (record)                 모든 이벤트를 감싸는 봉투입니다. eventId(중복 판단 키),
-│   │                                               eventType, occurredAt, aggregateType, aggregateId,
-│   │                                               data 로 구성됩니다.
-│   │                                               봉투는 공통에 두지만 data 안쪽 DTO 는 각 서비스가
-│   │                                               따로 정의합니다. 결합을 피하기 위함입니다.
-│   │                                               제네릭에 타입 제약이 없어 받는 쪽 DTO 는
-│   │                                               DomainEvent 를 구현하지 않아도 됩니다
-│   ├── AuthContextHeaders.java (final class)       X-User-Id·X-User-Role 헤더 키의 단일 출처입니다.
-│   │                                               HTTP 필터, 서비스 간 호출 인터셉터, 카프카 인터셉터가
-│   │                                               같은 문자열을 각자 들고 있으면 어긋나도 알 수 없습니다
-│   ├── KafkaSecurityInterceptor.java (class)       소비 시 카프카 헤더를 SecurityContext 로 복원합니다.
-│   │                                               컨슈머는 HTTP 요청 밖 스레드에서 실행되어 컨텍스트가
-│   │                                               비어 있고, 복원하지 않으면 컨슈머가 만든 행의
-│   │                                               createdBy 가 전부 SYSTEM 으로 남습니다.
-│   │                                               traceparent 는 다루지 않습니다. 스프링 카프카
-│   │                                               Observation 이 처리하며 직접 넣으면 헤더가 중복됩니다
-│   │
-│   ├── outbox/                                 "DB에는 저장됐는데 이벤트는 나가지 않았다"를 막는 장치
-│   │   ├── OutboxMessage.java (entity)         발행 대기 중인 이벤트 한 건입니다. 비즈니스 데이터와
-│   │   │                                       같은 트랜잭션으로 저장되므로 둘 다 되거나 둘 다 안 됩니다
-│   │   ├── OutboxRepository.java (interface)
-│   │   │                                       미발행 건을 조회합니다. 같은 aggregateId 에 대해
-│   │   │                                       앞선 미발행 건이 있는지도 확인해 순서를 보장합니다.
-│   │   │                                       재시도 10회를 넘긴 건은 조회에서 제외합니다.
-│   │   │                                       영구 실패 한 건이 뒤 메시지를 전부 막기 때문입니다
-│   │   ├── OutboxEventRecorder.java (class)    ★서비스가 호출하는 발행 입구입니다.
-│   │   │                                       record(이벤트) 한 줄로 봉투 생성·직렬화·행 저장·
-│   │   │                                       커밋 후 발행 신호까지 처리합니다.
-│   │   │                                       전파 속성이 MANDATORY 라 트랜잭션 없이 부르면
-│   │   │                                       즉시 예외가 납니다. 비즈니스 데이터와 같은
-│   │   │                                       트랜잭션이어야 Outbox 가 성립하기 때문입니다
-│   │   ├── OutboxPublisher.java (class)        실제 카프카 전송과 상태 기록의 단일 지점입니다.
-│   │   │                                       건당 독립 트랜잭션이라 한 건이 실패해도 앞서 성공한
-│   │   │                                       건의 상태 갱신은 유지됩니다
-│   │   ├── OutboxCommitListener.java (class)
-│   │   │                                       커밋 직후 비동기로 발행을 시작합니다.
-│   │   │                                       정상 경로는 여기서 처리되므로 지연이 거의 없습니다
-│   │   └── OutboxRelay.java (class)            놓친 건을 회수하는 안전망 스케줄러입니다(5초 주기).
-│   │                                           app.outbox.relay.enabled 로 한 인스턴스에서만
-│   │                                           실행합니다. 여러 인스턴스가 동시에 돌면 서로
-│   │                                           "앞에 미발행 건이 없다"고 판단해 순서 보장이 깨집니다
-│   │
-│   └── inbox/                                  "같은 이벤트를 두 번 처리했다"를 막는 장치
-│       ├── ProcessedEvent.java (entity)        처리한 eventId 기록입니다. PK 충돌 자체가 멱등 장치라
-│       │                                       별도 조회가 필요 없습니다.
-│       │                                       ID 가 발행자에게서 온 값이라 Persistable 을 구현해
-│       │                                       항상 persist 가 나가게 합니다. 그러지 않으면 merge 가
-│       │                                       호출되어 PK 충돌 없이 UPDATE 로 흘러갑니다
-│       ├── ProcessedEventRepository.java (interface)
-│       │                                       existsById 와 save 만 사용합니다
-│       └── InboxProcessor.java (class)         processOnce(eventId, topic, 로직) 형태로 사용합니다.
-│                                               기록과 비즈니스 로직을 한 트랜잭션으로 묶어
-│                                               "처리했다고 기록했는데 실제로는 실패"와
-│                                               "처리는 했는데 기록이 실패"를 둘 다 막습니다
-│
-├── response/
-│   ├── CommonApiResponse.java (class)              모든 API 응답의 겉껍데기입니다.
-│   │                                               { code, message, data, traceId }
-│   │                                               성공은 code 가 SUCCESS 입니다
-│   ├── PageResponse.java (record)                  목록 응답에서 data 안에 들어가는 형태입니다.
-│   │                                               { content: [...], page: { number, size,
-│   │                                                 totalElements, totalPages } }
-│   │                                               from(Page, 변환함수) 로 만들며 엔티티를 그대로
-│   │                                               노출하지 않게 합니다
-│   └── TraceIdResponseAdvice.java (class)          응답 직전에 traceId 를 채웁니다. 컨트롤러가 신경 쓸
-│                                                   필요가 없고, 성공 응답에도 실립니다. 문의가 들어왔을 때
-│                                                   해당 요청을 분산 추적에서 바로 찾기 위함입니다
-│
-└── security/
-    ├── filter/HeaderAuthenticationFilter.java (class)
-    │                                               게이트웨이가 넣어준 X-User-Id·X-User-Role 헤더를 읽어
-    │                                               SecurityContext 를 채웁니다. 뒤쪽 서비스는 JWT 를 직접
-    │                                               다루지 않습니다. 토큰 검증은 게이트웨이에서 끝났습니다.
-    │                                               게이트웨이는 헤더를 넣기 전에 바깥에서 들어온 같은 이름의
-    │                                               헤더를 먼저 지우므로 이 필터가 값을 그대로 믿어도 됩니다.
-    │                                               반대로 이 서비스에 직접 요청을 보내면 그 헤더가 그대로
-    │                                               신뢰되므로, 보안그룹으로 게이트웨이 밖에서 닿지 못하게 막아 둡니다.
-    │                                               Bean 이 아니라 공통 모듈의 보안 자동 설정에서 직접 생성합니다.
-    │                                               Bean 으로 두면 서블릿 전역 필터에도 등록돼 두 번 돕니다
-    ├── handler/CustomSecurityExceptionHandler.java (class)
-    │                                               401·403 을 공통 응답 형식으로 반환합니다.
-    │                                               시큐리티 필터는 DispatcherServlet 앞이라
-    │                                               GlobalExceptionHandler 가 잡지 못합니다.
-    │                                               이것이 없으면 인증 실패만 응답 형태가 달라집니다
-    ├── interceptor/RestClientAuthInterceptor.java (class)
-    │                                               서비스가 다른 서비스를 호출할 때 X-User-Id 를 헤더에
-    │                                               실어줍니다. 이것이 없으면 호출받은 쪽이 요청자를 알 수
-    │                                               없어 감사 컬럼이 시스템 계정으로 기록됩니다.
-    │                                               traceparent 는 넣지 않습니다. 분산 추적 라이브러리가
-    │                                               자동 처리하며, 직접 넣으면 트레이스가 갈라집니다.
-    │                                               ※ 아직 RestClient.Builder 에 연결되어 있지 않습니다.
-    │                                                 서비스 간 호출을 처음 구현할 때 연결 방식을 정합니다
-    ├── principal/CustomUserPrincipal.java (record)
-    │                                               SecurityContext 에 담기는 사용자 정보입니다.
-    │                                               accountId(UUID) 와 role(Role) 둘만 가집니다
-    └── annotation/CurrentUser.java (annotation)
-                                                    컨트롤러에서 사용자를 주입받는 애노테이션입니다
-
-src/main/resources/
-├── META-INF/spring/
-│   └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
-│                                                   위 config 6개를 자동 설정으로 등록합니다.
-│                                                   이 파일이 jar 에 들어가지 않으면 아무 Bean 도
-│                                                   올라오지 않는데 오류는 나지 않습니다
-└── db/migration/common/
-    ├── V1__outbox.sql                              outbox 테이블입니다. 공통이므로 V1~V19 대역을 씁니다
-    └── V2__inbox.sql                               processed_event 테이블입니다
+```http
+POST /api/v1/auth/logout
+(바디 없음)
 ```
 
-### 공통 모듈 사용법
+```
+Redis 에서 refresh:{jti} 삭제  →  refresh_token_log 에 revoked_at  →  쿠키 2개 만료  →  200
+```
 
-무엇이 들어 있는지보다 **어떻게 쓰는지**가 먼저 필요합니다. 자주 쓰는 6가지를 코드로 정리합니다.
+> **토큰이 없거나 만료됐어도 200 입니다.** 401 이면 클라이언트가 지우지 못하는 쿠키를
+> 들고 갇힙니다. 로그아웃은 여러 번 불러도 같아야 합니다.
+>
+> **액세스 토큰은 최대 30분 더 살아 있습니다.** JWT 라 회수할 수 없고, 그 대신
+> 수명을 짧게 둔 것입니다.
 
-#### 1) 응답 감싸기 — `CommonApiResponse`
+<br><br>
 
-컨트롤러의 반환 타입을 `CommonApiResponse<T>` 로 감쌉니다. `traceId` 는 응답 직전에 자동으로 채워지므로 신경 쓰지 않습니다.
+---
 
-```java
-@GetMapping("/api/v1/places/{placeId}")
-public CommonApiResponse<PlaceResponse> getPlace(@PathVariable UUID placeId) {
-    return CommonApiResponse.success(placeService.getPlace(placeId));
-}
+### 3-4. 내 계정 · 비밀번호 변경
+
+**둘 다 로그인이 필요합니다.** 게이트웨이가 넣어 준 `X-User-Id` 로 계정을 찾습니다.
+
+**내 계정**
+
+```http
+GET /api/v1/auth/me
 ```
 
 ```json
-{ "code": "SUCCESS", "message": "...", "data": { ... }, "traceId": "a1b2c3..." }
+{ "data": { "accountId": "01a0...", "email": "me@example.com", "role": "USER", "authProvider": "LOCAL" } }
 ```
 
-목록은 `PageResponse` 를 함께 씁니다. **엔티티를 그대로 넘기지 않도록** 변환 함수를 인자로 줍니다.
-
-```java
-@GetMapping("/api/v1/places")
-public CommonApiResponse<PageResponse<PlaceResponse>> getPlaces(Pageable pageable) {
-    Page<Place> page = placeService.search(pageable);
-    return CommonApiResponse.success(PageResponse.from(page, PlaceResponse::from));
-}
-```
-
-#### 2) 예외 던지기 — `ErrorCode` + `CustomException`
-
-먼저 이 서비스의 에러 코드 enum 을 만듭니다. `domain/exception/` 에 둡니다.
-
-```java
-@Getter
-@RequiredArgsConstructor
-public enum PlaceErrorCode implements ErrorCode {
-
-    PLACE_NOT_FOUND(HttpStatus.NOT_FOUND, "장소를 찾을 수 없습니다."),
-    PLACE_ALREADY_CLOSED(HttpStatus.CONFLICT, "이미 폐업 처리된 장소입니다.");
-
-    private final HttpStatus httpStatus;
-    private final String message;
-
-    @Override
-    public String getCode() {
-        return name();       // ★반드시 name() 을 그대로 반환합니다
-    }
-}
-```
-
-던질 때는 `CustomException` 하나만 씁니다. 예외 클래스를 상태별로 만들지 않습니다.
-
-```java
-Place place = placeRepository.findById(placeId)
-        .orElseThrow(() -> new CustomException(PlaceErrorCode.PLACE_NOT_FOUND));
-```
-
-`GlobalExceptionHandler` 가 받아서 이렇게 내보냅니다. 컨트롤러에 `try-catch` 를 쓰지 않습니다.
-
-```
-HTTP/1.1 404 Not Found
-{ "code": "PLACE_NOT_FOUND", "message": "장소를 찾을 수 없습니다.", "data": null, "traceId": "..." }
-```
-
-> **enum 상수 이름이 곧 API 계약입니다.** 프론트엔드가 `code` 값으로 분기하므로, 이름을 바꾸면 컴파일러가 잡아주지 않는 계약 변경이 됩니다.
-
-#### 3) 로그인한 사용자 꺼내기 — `@CurrentUser`
-
-```java
-@GetMapping("/api/v1/pets")
-public CommonApiResponse<List<PetResponse>> getMyPets(@CurrentUser CustomUserPrincipal principal) {
-    return CommonApiResponse.success(petService.findByAccount(principal.accountId()));
-}
-```
-
-`CustomUserPrincipal` 은 `accountId(UUID)` 와 `role(Role)` 둘만 가집니다. 게이트웨이가 헤더로 넣어준 값이라 **토큰을 파싱하는 코드를 서비스에 두지 않습니다.**
-
-기본 보안 체인의 규칙은 세 가지입니다.
-
-| 경로 | 규칙 |
-|---|---|
-| `/internal/**`, `/actuator/**` | 인증 없이 허용 |
-| **`/api/v1/admin/**`** | **`ADMIN` 역할만 허용** |
-| 그 외 전부 | 인증 필수 |
-
-관리자 API 를 공통 모듈에서 막는 이유는 **관리자 기능이 여러 서비스에 흩어져 있기 때문입니다.** 제보 처리는 report, 조건 정정은 policy, 폐업 처리는 place, 재색인은 search 에 있습니다. 각 서비스가 알아서 막게 하면 **한 곳만 빠뜨려도 그 서비스가 그대로 열립니다.**
-
-`hasRole("ADMIN")` 이 동작하는 것은 `HeaderAuthenticationFilter` 가 권한을 `"ROLE_" + role` 형태로 만들기 때문입니다. 접두사 규칙을 바꾸면 관리자 경로가 **403 만 반환하고 원인이 드러나지 않으므로** 건드리지 않습니다.
-
-로그인 경로처럼 열어야 하는 곳이 있으면 그 서비스가 자기 `SecurityFilterChain` 을 정의하면 되고, 그러면 공통 모듈 쪽이 물러납니다. **다만 그 경우 관리자 경로 보호도 함께 사라지므로 직접 넣어야 합니다.**
-
-#### 4) 엔티티 만들기 — `BaseEntity`
-
-```java
-@Entity
-@Table(name = "place")
-@Getter
-@NoArgsConstructor(access = AccessType.PROTECTED)
-public class Place extends BaseEntity {
-
-    @Id
-    @UuidGenerator(style = UuidGenerator.Style.VERSION_7)
-    private UUID id;
-
-    @Column(nullable = false, length = 200)
-    private String name;
-}
-```
-
-`createdAt`·`createdBy`·`updatedAt`·`updatedBy` 는 JPA Auditing 이 자동으로 채웁니다. **삭제만 수동입니다.**
-
-```java
-// 실제 DELETE 를 하지 않고 deletedAt 에 시각을 기록합니다
-place.delete(auditorProvider.current());
-```
-
-`auditorProvider.current()` 를 쓰는 이유는 생성·수정과 **같은 출처의 값**을 넣기 위해서입니다. 인증이 없는 배치라면 `app.auditor.system-name` 값이 들어갑니다.
-
-#### 5) 이벤트 발행하기 — `OutboxEventRecorder`
-
-먼저 이벤트를 `domain/event/payload/` 에 정의합니다. `DomainEvent` 를 구현하면 **자기 라우팅 정보를 스스로 들고 다니게** 됩니다.
-
-```java
-public record PlaceUpdatedEvent(
-        UUID placeId,
-        String name,
-        int version
-) implements DomainEvent {
-
-    @Override
-    public String getTopic() {
-        return "place.updated";
-    }
-
-    @Override
-    public String getAggregateType() {
-        return "Place";
-    }
-
-    @Override
-    public String getAggregateId() {
-        return placeId.toString();
-    }
-}
-```
-
-발행은 한 줄입니다.
-
-```java
-@Transactional                                    // ★반드시 트랜잭션 안에서 부릅니다
-public void updatePlace(UUID placeId, PlaceUpdateCommand command) {
-    Place place = placeRepository.findById(placeId)
-            .orElseThrow(() -> new CustomException(PlaceErrorCode.PLACE_NOT_FOUND));
-
-    place.update(command.name());
-
-    outboxEventRecorder.record(new PlaceUpdatedEvent(placeId, place.getName(), place.getVersion()));
-}
-```
-
-`record()` 안에서 봉투 생성 → 직렬화 → `outbox` 행 저장 → 커밋 후 발행 신호까지 전부 처리합니다. 카프카를 직접 부르는 코드는 서비스에 없습니다.
-
-> **트랜잭션이 없으면 즉시 예외가 납니다.** 전파 속성이 `MANDATORY` 라 그렇습니다. 비즈니스 데이터와 `outbox` 행이 같은 트랜잭션으로 저장되어야 "둘 다 되거나 둘 다 안 된다"가 성립하기 때문입니다.
-
-#### 6) 이벤트 받기 — 소비 DTO + `InboxProcessor`
-
-**받는 쪽은 발행 서비스의 이벤트 클래스를 가져다 쓰지 않고 자기 DTO 를 정의합니다.** `infrastructure/message/kafka/consumer/dto/` 에 둡니다.
-
-```java
-@JsonIgnoreProperties(ignoreUnknown = true)       // ★필수
-public record PlaceUpdatedMessage(
-        UUID placeId,
-        String name
-) {}
-```
-
-- `@JsonIgnoreProperties` 가 없으면 **발행 쪽이 필드를 하나 추가하는 순간 이쪽이 깨지고** 두 서비스의 배포 순서가 묶입니다
-- `DomainEvent` 는 구현하지 않습니다. 받는 쪽에는 토픽·집합체 값이 의미가 없습니다
-- 실제로 쓰는 필드만 선언하면 됩니다. 위 예시는 `version` 을 받지 않습니다
-
-리스너는 봉투를 타입 그대로 받습니다. 공통 모듈의 메시지 컨버터가 파라미터 타입을 읽어 역직렬화합니다.
-
-```java
-@KafkaListener(topics = "place.updated", groupId = "${spring.application.name}")
-public void onPlaceUpdated(EventEnvelope<PlaceUpdatedMessage> envelope) {
-    inboxProcessor.processOnce(
-            envelope.eventId(),
-            envelope.eventType(),
-            () -> searchIndexService.reindex(envelope.data())
-    );
-}
-```
-
-- `topics` 문자열은 발행 쪽 `getTopic()` 이 반환하는 값과 **정확히 같아야 합니다.** 어긋나도 오류가 나지 않고 이벤트만 오지 않으므로 눈으로 확인합니다
-- `processOnce` 로 감싸면 처리 이력과 비즈니스 로직이 한 트랜잭션으로 묶여 **같은 이벤트를 두 번 받아도 한 번만 처리됩니다**
-- **예외는 잡지 않고 그대로 던집니다.** 컨슈머 밖으로 나가야 재시도와 DLQ 전송이 동작합니다. 1초부터 2배씩 3회 재시도하고, 그래도 실패하면 `{원본토픽}.dlq` 로 보낸 뒤 넘어갑니다
+> **`nickname` 이 없습니다.** `user_profile` 의 데이터라 auth 가 user 를 불러야 하는데,
+> auth 는 다른 서비스를 부르지 않기로 했습니다. 프론트는 `GET /users/me` 를 따로 부릅니다.
 
 ---
 
-## 7. DB를 가진 서비스 (place 예시)
+**비밀번호 변경**
 
-10개 서비스가 이 형태입니다. 아래 트리에서 `place`를 자기 도메인명으로 바꿔 읽으면 됩니다.
-
-```
-com.pawtrail.place
-│
-├── PlaceApplication.java (class)                   진입점입니다.
-│                                                   @SpringBootApplication
-│                                                   @EntityScan(basePackages =
-│                                                       {"com.pawtrail.place", "com.pawtrail.common"})
-│                                                   @EnableJpaRepositories(basePackages = { 위와 동일 })
-│
-│                                                   scanBasePackages 를 지정하지 않습니다. 기본값이
-│                                                   이 클래스가 속한 패키지이고, 공통 모듈은 자동 설정으로
-│                                                   등록되므로 스캔 대상에 넣으면 두 번 등록됩니다.
-│                                                   반면 뒤의 두 애노테이션에는 공통 모듈을 지정합니다.
-│                                                   Outbox·Inbox 엔티티와 레포지터리는 자동 설정이
-│                                                   잡아주지 않기 때문입니다
-│
-├── presentation/                                   ── HTTP를 받는 층 ──
-│   ├── PlaceController.java (class)                /api/v1/places — 브라우저가 호출하는 공개 API입니다
-│   ├── PlaceInternalController.java (class)
-│   │                                               /internal/places — 다른 서비스만 호출하는 API입니다.
-│   │                                               게이트웨이가 라우팅하지 않아 외부에서 도달할 수 없습니다.
-│   │                                               파일을 나눠두면 내부용임이 한눈에 드러납니다
-│   └── request/
-│       └── PlaceCreateRequest.java (record)        요청 바디 DTO입니다. @Valid 검증 애노테이션이 붙는
-│                                                   자리이며, toCommand()로 application 층 입력으로
-│                                                   변환합니다
-│
-├── application/                                    ── 순서를 조율하는 층 ──
-│   ├── service/PlaceService.java (class)           무엇을 어떤 순서로 할지 정합니다. 저장하고, 이벤트를
-│   │                                               발행하고, 결과를 조립합니다. @Transactional이 붙는
-│   │                                               자리입니다
-│   └── dto/
-│       ├── command/
-│       │   └── PlaceCreateCommand.java (record)
-│       │                                           서비스에 들어가는 입력입니다
-│       └── response/
-│           └── PlaceResponse.java (record)         서비스가 내놓는 출력입니다. 엔티티를 그대로 담지 않고
-│                                                   from(엔티티) 정적 메서드로 변환하며, 컨트롤러가 이를
-│                                                   그대로 반환합니다
-│
-├── domain/                                         ── 이 서비스가 무엇인지 ──
-│   ├── model/Place.java (entity)                   데이터와 그 데이터를 바꾸는 규칙을 가집니다
-│   ├── event/
-│   │   ├── PlaceEventProducer.java (interface)
-│   │   │                                           이벤트를 내보낸다는 약속입니다.
-│   │   │                                           카프카라는 단어가 여기 나오지 않습니다
-│   │   └── payload/
-│   │       └── PlaceUpdatedEvent.java (record)
-│   │                                               이벤트에 실을 데이터입니다. 공통 모듈에 두지 않습니다.
-│   │                                               두면 발행자가 필드를 추가할 때 소비자까지 재배포해야 합니다
-│   ├── exception/PlaceErrorCode.java (enum)        이 서비스만의 에러 코드입니다. ErrorCode를 구현하며
-│   │                                               PLACE_NOT_FOUND 등을 정의합니다
-│   ├── provider/
-│   │   ├── RawDocumentData.java (record)           다른 서비스에서 받아올 데이터의 모양입니다
-│   │   └── RawDocumentProvider.java (interface)
-│   │                                               그 데이터를 가져다준다는 약속입니다
-│   └── repository/
-│       ├── PlaceRepository.java (interface)        저장·조회의 약속입니다.
-│       │                                           JPA라는 단어가 여기 나오지 않습니다
-│       └── dto/
-│           └── PlaceSearchConditionDto.java (record)
-│                                                   조회 조건·결과 전용 객체입니다
-│
-├── infrastructure/                                 ── 바깥과 실제로 대화하는 층 ──
-│   ├── config/                                     이 서비스만의 설정입니다
-│   ├── persistence/
-│   │   ├── JpaPlaceRepository.java (interface)
-│   │   │                                           스프링 데이터 JPA 기본 조회입니다 (findById 등)
-│   │   ├── QueryDslPlaceRepository.java (class)
-│   │   │                                           복잡한 조건 조회입니다. 조회가 단순한 서비스는
-│   │   │                                           이 파일을 만들지 않아도 됩니다
-│   │   └── PlaceRepositoryImpl.java (class)        위 둘을 조합해 domain의 인터페이스를 구현합니다
-│   ├── message/kafka/
-│   │   ├── consumer/
-│   │   │   ├── PlaceEventConsumer.java (class)
-│   │   │   │                                       @KafkaListener입니다. 받은 이벤트를
-│   │   │   │                                       InboxProcessor.processOnce로 감싸 처리합니다
-│   │   │   └── dto/
-│   │   │       └── PlaceIngestedMessage.java (record)
-│   │   │                                           ★받는 쪽이 직접 정의하는 소비용 DTO입니다.
-│   │   │                                           발행 서비스의 이벤트 클래스를 가져다 쓰지 않고
-│   │   │                                           실제로 쓰는 필드만 선언합니다.
-│   │   │                                           @JsonIgnoreProperties(ignoreUnknown = true)를
-│   │   │                                           반드시 붙입니다. 없으면 발행 쪽이 필드를 하나
-│   │   │                                           추가하는 순간 이쪽이 깨지고 배포 순서가 묶입니다.
-│   │   │                                           DomainEvent는 구현하지 않습니다
-│   │   └── producer/
-│   │       └── PlaceEventProducerImpl.java (class)
-│   │                                               OutboxEventRecorder.record()를 호출해
-│   │                                               outbox에 적재합니다. 호출하는 서비스 메서드에
-│   │                                               트랜잭션이 있어야 합니다
-│   └── provider/client/
-│       ├── RawDocumentClient.java (interface)      @HttpExchange 인터페이스입니다. 다른 서비스 호출을
-│       │                                           메서드 선언만으로 정의합니다
-│       ├── dto/
-│       │   └── RawDocumentResponse.java (record)
-│       │                                           응답을 받는 DTO입니다
-│       └── RawDocumentProviderImpl.java (class)
-│                                                   Client를 호출해 domain의 Provider를 구현합니다.
-│                                                   응답 DTO를 domain의 Data 타입으로 변환하는 자리입니다
-│
-└── src/main/resources/
-    ├── application.yml                             서비스명, 포트, DB 접속, 유레카 등록 등을 정의합니다
-    └── db/migration/
-        └── V20__place.sql                          서비스별 마이그레이션은 V20부터 시작합니다.
-                                                    V1~V19는 공통 모듈이 사용하는 대역입니다.
-                                                    PK는 uuid이며 애플리케이션이 v7을 생성해 넣습니다
+```http
+PATCH /api/v1/auth/me/password
+{ "currentPassword": "test1234", "newPassword": "newpass5678" }
 ```
 
-
-### 요청 하나가 지나가는 길
-
-위 폴더들이 실제로 어떤 순서로 엮이는지입니다. **새 기능을 만들 때 이 순서대로 파일을 만들면 됩니다.**
-
-`POST /api/v1/places` 로 장소를 등록하는 경우입니다.
-
 ```
-① presentation/request/PlaceCreateRequest.java
-   요청 바디를 받고 @Valid 로 형식을 검사합니다.
-   toCommand() 로 application 층 입력으로 바꿉니다.
-        ↓
-② presentation/PlaceController.java
-   @PostMapping 하나. 서비스를 부르고 CommonApiResponse 로 감싸 반환합니다.
-   여기에 if 문이 들어가기 시작하면 판단이 새어 나온 것입니다.
-        ↓
-③ application/dto/command/PlaceCreateCommand.java
-   서비스에 들어가는 입력입니다. 요청 DTO 와 분리하는 이유는
-   HTTP 형태가 바뀌어도 서비스 시그니처가 안 바뀌게 하기 위함입니다.
-        ↓
-④ application/service/PlaceService.java
-   @Transactional 이 붙는 자리입니다.
-   저장하고, 이벤트를 기록하고, 응답을 조립하는 순서를 정합니다.
-   "조건이 맞는지" 같은 판단은 여기서 하지 않고 domain 에 맡깁니다.
-        ↓
-⑤ domain/model/Place.java
-   데이터와 그 데이터를 바꾸는 규칙입니다. setter 대신
-   update(...) 같은 의미 있는 메서드를 둡니다.
-        ↓
-⑥ domain/repository/PlaceRepository.java
-   "저장한다"는 약속만 선언합니다. JPA 라는 단어가 나오지 않습니다.
-        ↓
-⑦ infrastructure/persistence/PlaceRepositoryImpl.java
-   위 약속을 JpaPlaceRepository·QueryDslPlaceRepository 로 구현합니다.
-        ↓
-⑧ domain/event/payload/PlaceUpdatedEvent.java
-   발행할 이벤트입니다. DomainEvent 를 구현합니다.
-        ↓
-⑨ infrastructure/message/kafka/producer/PlaceEventProducerImpl.java
-   OutboxEventRecorder.record() 를 호출합니다.
-   ④의 트랜잭션 안에서 불려야 합니다.
-        ↓
-⑩ application/dto/response/PlaceResponse.java
-   from(엔티티) 로 변환합니다. 컨트롤러가 이것을 그대로 반환합니다.
+소셜 계정인가              ──▶  400 PASSWORD_NOT_SUPPORTED   (비밀번호가 없음)
+현재 비밀번호가 맞나         ──▶  400 CURRENT_PASSWORD_MISMATCH
+새 비밀번호로 교체
+tokens_valid_from 갱신     ──▶  이 계정의 모든 리프레시 토큰이 무효
+쿠키 2개 만료              ──▶  200. 다시 로그인해야 함
 ```
 
-**막히기 쉬운 자리 3가지**
+> **바꾸면 본인도 로그아웃됩니다.** 다른 기기의 세션도 함께 끊깁니다.
+> 안 그러면 *"비밀번호를 바꿨는데 30분 뒤 갑자기 튕기는"* 상태가 됩니다.
+>
+> **현재 비밀번호에는 길이 규칙이 없습니다.** 규칙이 바뀌기 전에 만든 비밀번호가
+> 형식에 안 맞아 못 바꾸는 일이 없어야 합니다.
 
-| 증상 | 원인 |
-|---|---|
-| `IllegalTransactionStateException` 이 나며 이벤트 발행이 실패합니다 | ④에 `@Transactional` 이 없습니다. `OutboxEventRecorder` 는 트랜잭션 없이 부를 수 없습니다 |
-| 이벤트를 발행했는데 받는 서비스가 반응하지 않습니다 | 토픽 문자열이 어긋났거나, 받는 쪽 `groupId` 가 겹쳤습니다. Kafka UI(`tools` 프로파일)로 토픽에 메시지가 실렸는지부터 확인합니다 |
-| 응답 JSON 에 엔티티 필드가 그대로 노출됩니다 | ⑩을 거치지 않고 엔티티를 반환했습니다. 컨트롤러 반환 타입이 `CommonApiResponse<Place>` 가 아닌지 확인합니다 |
-
-**다른 서비스를 호출해야 한다면** ⑥⑦ 대신 `domain/provider/` 에 인터페이스를, `infrastructure/provider/client/` 에 `@HttpExchange` 구현을 둡니다. 구조는 같습니다 — 약속은 `domain`, 구현은 `infrastructure` 입니다.
-
-
-### 이벤트를 발행하는 서비스는 관리자 재발행 API 를 만듭니다
-
-`OutboxRelay` 는 안전망이지 완전한 보장이 아닙니다. **재시도 횟수가 10 에 이른 건은 조회에서 제외하므로**, 카프카가 오래 멈춰 있었거나 토픽 이름이 어긋난 채로 시간이 지나면 그 행은 `published_at` 이 `NULL` 인 상태로 남고 아무도 다시 보내지 않습니다.
-
-**그 뒤로는 에러도 남지 않습니다.** 실패한 것이 아니라 조회 대상에서 빠진 것이기 때문입니다. `outbox` 테이블에 `retry_count` 와 `last_error` 컬럼을 처음부터 둔 이유가 이 자리이며, **그 값을 보고 다시 보내는 수단이 관리자 API 입니다.** 이것을 만들지 않으면 이벤트가 조용히 유실되는 경로가 열린 채로 배포됩니다.
-
-#### 경로
-
-```
-GET  /api/v1/admin/{리소스}/outbox             미발행 건 목록
-POST /api/v1/admin/{리소스}/outbox/{id}/retry   한 건 재발행
-```
-
-`{리소스}` 는 그 서비스의 관리자 접두사와 같습니다. auth 는 `accounts`, place 는 `places`, report 는 `reports` 입니다.
-
-**두 번째 마디가 어느 서비스인지를 정한다**는 라우팅 규칙을 그대로 따르므로 게이트웨이에 라우트를 새로 열 필요가 없습니다. `/api/v1/admin/places/**` 처럼 이미 그 서비스로 가도록 열려 있기 때문입니다.
-
-#### 재발행할 때 `retry_count` 를 0 으로 되돌립니다
-
-**빠뜨리면 버튼이 아무 일도 하지 않습니다.** `OutboxRelay` 의 조회 조건이 `retry_count < 10` 이므로, 카운터가 10 인 채로 두면 재발행을 눌러도 그 행은 여전히 조회되지 않습니다. 화면에는 성공으로 보이고 이벤트는 계속 나가지 않습니다.
-
-`last_error` 도 함께 비웁니다. 다음에 또 실패하면 그때의 원인이 들어가야 하는데, 예전 값이 남아 있으면 언제 난 오류인지 구분되지 않습니다.
-
-#### 왜 공통 모듈에 두지 않는가
-
-`OutboxMessage` 와 그 레포지터리가 공통 모듈에 있으므로 컨트롤러도 거기 두면 될 것처럼 보입니다. 그렇게 하지 않는 이유는 두 가지입니다.
-
-**공통 모듈에는 관리자 컨트롤러를 두지 않습니다.** 공통 모듈은 기술적 관심사만 담고, 화면과 운영 기능은 각 서비스가 가집니다.
-
-**재발행은 실제로 그 서비스의 운영 기능입니다.** 관리자가 하는 일이 그 서비스 데이터베이스의 행을 고쳐 다시 내보내는 것이므로, 그 데이터를 소유한 쪽이 처리하는 것이 자연스럽습니다.
-
-#### 만드는 서비스와 보호
-
-이벤트를 발행하는 서비스만 해당합니다. config 2계층에 `app.outbox.relay.enabled: true` 가 있는 곳이 기준입니다. 소비만 하는 서비스에는 `outbox` 테이블 자체가 없습니다.
-
-경로가 `/api/v1/admin/**` 이므로 공통 모듈의 보안 체인이 `ADMIN` 역할만 통과시킵니다. **다만 그 서비스가 자기 `SecurityFilterChain` 을 정의하면 그 보호가 물러나므로 직접 넣어야 합니다.**
-
-관리자 화면은 만들지 않습니다. Swagger UI 에서 호출합니다.
-
-#### 재발행된 이벤트는 순서가 어긋나 있을 수 있습니다
-
-멈춘 건은 같은 집합체의 뒤 이벤트를 막지 않습니다. 순서를 지키려고 기다리게 하면 그 집합체의 이벤트가 통째로 멈추기 때문입니다. 따라서 재발행하는 시점에는 **더 나중에 만들어진 이벤트가 이미 나가 있을 수 있습니다.**
-
-지금은 문제가 되지 않습니다. 이벤트 5개가 전부 "네가 가진 것이 낡았다"를 알리는 형태이고, 받는 쪽이 그 시점의 현재 상태를 다시 읽어 가기 때문입니다. **다만 순서 자체가 의미를 갖는 이벤트를 나중에 추가한다면 이 전제가 깨집니다.**
+<br><br>
 
 ---
 
-## 8. DB가 없는 서비스 (verdict)
-
-verdict, congestion, route 가 여기 해당합니다. 위 형태에서 저장 관련 계층이 통째로 빠집니다.
-
-route 가 여기 들어온 것은 나중입니다. 동물병원이 place 로 편입되면서 소유하던 DB 가 사라졌고, 남은 일이 카카오맵 경로 계산뿐이 되었습니다.
+### 3-5. 비밀번호 재설정 — 잊었을 때
 
 ```
-com.pawtrail.verdict
+① POST /password/reset-request  {email}
+        │
+        ├──▶  계정이 있고 비밀번호를 쓰는 계정이면   코드 발송  (pwreset:{email})
+        ├──▶  계정이 없거나 소셜이면              아무것도 안 함
+        └──▶  어느 쪽이든 200                    ← 계정 존재를 숨김
+        │
+        ▼
+② POST /password/reset  {email, code, newPassword}
+        │
+        ├──▶  코드 대조                5회 틀리면 폐기
+        ├──▶  비밀번호 교체            BCrypt
+        ├──▶  tokens_valid_from 갱신   그 계정의 모든 리프레시 토큰이 무효가 됨
+        └──▶  200
+```
+
+```http
+POST /api/v1/auth/password/reset-request
+{ "email": "me@example.com" }
+
+POST /api/v1/auth/password/reset
+{ "email": "me@example.com", "code": "482913", "newPassword": "newpass5678" }
+```
+
+---
+
+**반드시 지키는 것 셋입니다.**
+
+| 규칙 | 왜 |
+|---|---|
+| **계정이 없어도 200** | 아니면 응답만 보고 회원 이메일 목록을 캐낼 수 있습니다 |
+| **시도 5회 제한** | 6자리는 백만 가지뿐이라 무차별 대입이 실제로 됩니다 |
+| **소셜 계정은 대상이 아님** | 비밀번호가 없습니다. 판단은 `authProvider.hasPassword()` 로 |
+
+> 발송 실패도 **200 으로 삼키고 로그만 남깁니다.** 500 을 내면 그 자체가
+> *"이 이메일은 가입돼 있다"* 는 신호가 됩니다. 발송 제한에 걸려도 같습니다.
+> [3-2](#3-2-회원가입--이메일-인증을-먼저) 의 가입 인증과 **정반대**인 점입니다.
+
+---
+
+**"변경" 과 "재설정" 을 합치면 안 됩니다.**
+
+| | 변경 | 재설정 |
+|---|---|---|
+| 상태 | 로그인됨 | 비밀번호를 모름 |
+| 본인 확인 | 현재 비밀번호 | 메일 코드 |
+| 합치면 | **이메일만 알면 남의 비밀번호를 바꿀 수 있음** | |
+
+<br><br>
+
+---
+
+### 3-6. 소셜 로그인 — 구글
+
+```
+① GET /oauth/google/authorize
+        │
+        ├──▶  state · nonce 생성       Redis  oauth:state:{state} = nonce   TTL 5분
+        ├──▶  oauth_state 쿠키         HttpOnly · SameSite=Lax · Path=/api/v1/auth/oauth
+        └──▶  302  →  구글 로그인 화면
+                      │
+                      ▼
+              사용자가 구글에서 로그인하고 동의
+                      │
+                      ▼
+② GET /oauth/google/callback?code=...&state=...     ← 구글이 브라우저를 여기로 보냄
+        │
+        ├──▶  state 대조             쿠키 값 = 쿼리 값 = Redis 에 있는 값   (1회용 소비)
+        ├──▶  code 로 토큰 교환       POST oauth2.googleapis.com/token  (client-secret 사용)
+        ├──▶  id_token 검증          구글 JWKS 로 서명 · nonce · email_verified
+        │
+        ├──▶  계정 매칭
+        │       provider_user_id = 구글 sub 인 계정   ──▶  재로그인          isNew=false
+        │       없고, email 이 같은 LOCAL 계정         ──▶  자동 연결          isNew=false
+        │                                                 (auth_provider 는 LOCAL 유지)
+        │       둘 다 없음                            ──▶  신규 GOOGLE 계정   isNew=true
+        │                                                 account.created (nickname=null)
+        │       탈퇴한 계정                            ──▶  /login/error?reason=WITHDRAWN
+        │
+        ├──▶  토큰 2개 발급 · Set-Cookie
+        └──▶  302  →  {frontend}/login/success?isNew=true|false
+
+실패하면  302  →  {frontend}/login/error?reason=FAILED     (JSON 을 낼 수 없는 자리)
+취소하면  302  →  {frontend}/login                          (reason 없음)
+```
+
+---
+
+**JSON API 가 아닙니다.** 둘 다 브라우저를 다른 곳으로 보내는 302 응답입니다.
+
+| | 요청 | 응답 |
+|---|---|---|
+| `authorize` | 프론트가 `window.location = ...` 로 이동 | 302 → 구글 |
+| `callback` | 구글이 브라우저를 보냄 | 302 → 프론트 `/login/success` 또는 `/login/error` |
+
+> 실패해도 JSON 을 낼 수 없습니다. 콜백은 **브라우저 주소창이 오는 곳**이라 JSON 을
+> 내면 흰 화면에 날 JSON 이 보입니다. 그래서 `/login/error?reason=` 으로 보냅니다.
+
+---
+
+**프론트 라우트 셋입니다.**
+
+| 경로 | 언제 |
+|---|---|
+| `/login/success?isNew=true` | 신규 가입. **닉네임이 없으므로 프로필 설정으로 유도** |
+| `/login/success?isNew=false` | 재로그인 또는 기존 계정에 연결됨 |
+| `/login/error?reason=WITHDRAWN` | 탈퇴한 계정 |
+| `/login/error?reason=FAILED` | 그 밖의 전부. 사용자가 할 일은 "다시 시도" 하나라 나누지 않음 |
+| `/login` (쿼리 없음) | 구글 화면에서 취소함 |
+
+---
+
+**계정 매칭이 셋으로 갈립니다.**
+
+| 조건 | 결과 |
+|---|---|
+| `provider_user_id` 가 구글 `sub` 와 같은 계정이 있음 | 그 계정으로 로그인 |
+| 없고, 같은 이메일의 **LOCAL** 계정이 있음 | **그 계정에 `sub` 를 연결하고 로그인.** `auth_provider` 는 LOCAL 유지 |
+| 둘 다 없음 | GOOGLE 계정을 새로 만듦. `account.created` 발행 (`nickname: null`) |
+
+> **자동 연결이 안전한 이유** — LOCAL 가입도 이메일 인증을 거쳤고 구글도 이메일을 확인해 줬으므로
+> 양쪽 다 **그 이메일의 주인임이 확인된 상태**입니다.
+>
+> **`auth_provider` 를 LOCAL 로 두는 이유** — GOOGLE 로 바꾸면 `hasPassword()` 가 false 가 되어
+> **비밀번호가 멀쩡히 있는데 비밀번호 로그인이 막힙니다.**
+
+---
+
+**저장하는 것은 구글 `sub` 하나뿐입니다.**
+
+| 값 | 저장 | 왜 |
+|---|---|---|
+| `code` | ✗ | 1회용, 수분 만료 |
+| 구글 `access_token` | ✗ | 구글 API 를 대신 호출할 때만 필요한데 우리는 안 씀 |
+| `id_token` 의 `sub` | ✓ `provider_user_id` | 로그인할 때마다 같은 값이 와서 계정을 찾는 열쇠 |
+
+로그인 뒤에는 **우리 JWT** 를 쓰므로 구글 토큰은 신원 확인 순간까지만 살아 있습니다.
+
+---
+
+**`state` · `nonce` · 상태 쿠키가 막는 것입니다.**
+
+| 장치 | 막는 것 |
+|---|---|
+| `state` (Redis, 5분, 1회용) | 우리가 시작하지 않은 콜백 |
+| `oauth_state` 쿠키 | **다른 브라우저에서 시작한 콜백.** 공격자가 자기 콜백 URL 을 피해자에게 열게 하는 것 |
+| `nonce` (`id_token` 안) | 가로챈 `id_token` 의 재사용 |
+
+> `oauth_state` 쿠키만 **`SameSite=Lax`** 입니다. 콜백은 구글에서 오는 요청이라
+> `Strict` 면 쿠키가 안 실립니다. 토큰 쿠키는 그대로 `Strict` 입니다.
+
+<br><br>
+
+---
+
+### 3-7. 탈퇴 — 메일 인증을 거침
+
+```
+① POST /withdraw/verify-request     (바디 없음 — 로그인한 계정의 이메일로 보냄)
+        │
+        └──▶  코드 발송       Redis  withdraw:{email}  TTL 10분   발송 제한은 용도별로 따로
+        │
+        ▼
+② DELETE /me  {code}
+        │
+        ├──▶  코드 대조 (Lua)        맞으면 지우고 진행 · 틀리면 코드는 남기고 시도 +1
+        │
+        ├──▶  account 행 갱신        status  WITHDRAWN
+        │                            email   withdrawn+{id}@pawtrail.invalid   ← 재가입 가능하게
+        │                            provider_user_id  NULL
+        ├──▶  토큰 전부 폐기          tokens_valid_from 갱신 · 이력 전부 revoked_at
+        ├──▶  outbox                 account.withdrawn  {accountId}
+        └──▶  200 + 쿠키 2개 만료
+        │
+        └──▶  카프카  ──▶  user · pet · report · review · notification 이 각자 데이터를 지움
+```
+
+```http
+POST /api/v1/auth/withdraw/verify-request
+(바디 없음)
+
+DELETE /api/v1/auth/me
+{ "code": "482913" }
+```
+
+---
+
+**왜 메일 인증인가**
+
+비밀번호로 확인하면 **소셜 계정은 비밀번호가 없어 확인할 수 없습니다.**
+이메일은 로컬이든 소셜이든 항상 있습니다. 게다가 비밀번호는 브라우저 자동완성으로
+뚫릴 수 있지만 **메일함은 별도 로그인이 필요해 오히려 더 강한 확인**입니다.
+
+---
+
+**행을 지우지 않고 식별자를 끊습니다.**
+
+| 컬럼 | 탈퇴 후 |
+|---|---|
+| `status` | `WITHDRAWN` |
+| `email` | `withdrawn+{accountId}@pawtrail.invalid` |
+| `provider_user_id` | `NULL` |
+| 행 자체 | **남김** |
+
+| 왜 남기나 | 왜 끊나 |
+|---|---|
+| 이벤트 소비가 실패했을 때 *"이 accountId 가 정말 탈퇴했나"* 를 확인할 근거 | 안 끊으면 **그 이메일·그 구글 계정으로 영영 재가입이 안 됨** |
+| `refresh_token_log` 가 고아가 되지 않음 | `.invalid` 는 존재할 수 없는 TLD 라 실수로 메일이 나가도 안 감 |
+
+> **재가입하면 완전히 새 계정입니다.** 옛 즐겨찾기·후기·반려동물은 안 돌아옵니다.
+> 탈퇴가 곧 삭제이므로 그것이 맞는 동작이며, **탈퇴 확인 화면에 그 문구가 있어야 합니다.**
+
+<br><br>
+
+---
+
+### 3-8. 관리자 — outbox 재발행
+
+이벤트 발행이 10번 실패하면 `OutboxRelay` 가 포기합니다. **그 뒤로는 아무도 다시
+보내지 않으므로** 사람이 다시 보내는 수단입니다.
+
+```http
+GET /api/v1/admin/accounts/outbox?page=0&size=20
+```
+
+```json
+{
+  "data": {
+    "content": [
+      {
+        "id": "7f3e...",
+        "eventId": "a1b2...",
+        "topic": "account.created",
+        "aggregateType": "Account",
+        "aggregateId": "01a0...",
+        "createdAt": "2026-09-01T14:22:10",
+        "retryCount": 10,
+        "lastError": "TimeoutException: Topic account.created not present in metadata"
+      }
+    ],
+    "page": { "number": 0, "size": 20, "totalElements": 1, "totalPages": 1 }
+  }
+}
+```
+
+| 응답에 있음 | 없음 |
+|---|---|
+| `retryCount` · `lastError` — **눌러도 되는 상황인지** 판단하는 재료 | `payload` — 이메일·닉네임이 들어 있어 안 담습니다 |
+
+```
+TimeoutException      눌러도 됨 — 카프카가 잠깐 죽었던 것
+직렬화 오류            눌러도 또 실패함 — 코드를 먼저 고쳐야 함
+```
+
+```http
+POST /api/v1/admin/accounts/outbox/{id}/retry
+```
+
+| 응답 | 언제 |
+|---|---|
+| 200 | 발행됨. `retryCount` 는 **그대로 둡니다** — "몇 번 실패한 뒤 사람이 보냈는지" 의 기록 |
+| 500 `OUTBOX_REPUBLISH_FAILED` | 또 실패. 성공으로 응답하면 안 됩니다 |
+
+> **비어 있는 목록이 정상입니다.** 재시도 상한을 넘긴 건만 뜨므로 뜨면 누르면 됩니다.
+> 관리자 역할을 얻는 법과 부르는 법은 [7-1](#7-1-관리자-지정) · [7-2](#7-2-관리자-api-부르기) 에 있습니다.
+
+<br><br>
+
+---
+
+### 3-9. 에러 코드 16개
+
+| 코드 | HTTP | 언제 |
+|---|---|---|
+| `EMAIL_ALREADY_EXISTS` | 409 | 가입 인증 요청 · 가입 시 이미 있는 이메일 |
+| `EMAIL_NOT_VERIFIED` | 400 | 인증 없이 가입 시도 |
+| `INVALID_VERIFICATION_CODE` | 400 | 코드 틀림 · 만료 · 없음 (가입 · 재설정 · 탈퇴 공통) |
+| `TOO_MANY_VERIFICATION_ATTEMPTS` | 429 | 5회 틀려 코드가 폐기됨 |
+| `MAIL_SEND_COOLDOWN` | 429 | 60초 안 재요청 · 시간당 5통 초과 (가입 인증만) |
+| `MAIL_SEND_FAILED` | 500 | SMTP 실패 (가입 인증 · 탈퇴 인증) |
+| `LOGIN_FAILED` | 401 | 이메일 없음 · 비밀번호 틀림 · 소셜 계정 — **구분 안 함** |
+| `ACCOUNT_WITHDRAWN` | 403 | 탈퇴한 계정으로 로그인 · 갱신 · 탈퇴 인증 |
+| `PASSWORD_NOT_SUPPORTED` | 400 | 소셜 계정이 비밀번호 변경 시도 |
+| `INVALID_REFRESH_TOKEN` | 401 | 갱신 실패 전부 — **구분 안 함** |
+| `CURRENT_PASSWORD_MISMATCH` | 400 | 비밀번호 변경 시 현재 비밀번호 틀림 |
+| `UNSUPPORTED_OAUTH_PROVIDER` | 400 | `/oauth/naver/...` 처럼 없는 제공자 |
+| `OAUTH_AUTHENTICATION_FAILED` | 401 | 구글 인증 실패 (콜백에서는 302 로 바뀜) |
+| `INVALID_OAUTH_STATE` | 400 | state 불일치 (콜백에서는 302 로 바뀜) |
+| `OUTBOX_REPUBLISH_FAILED` | 500 | 관리자 재발행 실패 |
+| `ACCOUNT_NOT_FOUND` | 404 | 헤더의 계정 ID 로 못 찾음 (탈퇴 직후 등) |
+
+---
+
+**코드를 나누는 기준은 "프론트가 할 일이 다른가" 입니다.**
+
+| 같은 코드 | 이유 |
+|---|---|
+| 이메일 없음 · 비밀번호 틀림 → `LOGIN_FAILED` | 나누면 이메일 존재가 드러남. 사용자가 할 일도 같음 |
+| 갱신 실패 전부 → `INVALID_REFRESH_TOKEN` | 어느 경우든 로그인 화면으로 |
+
+| 다른 코드 | 이유 |
+|---|---|
+| 코드 틀림 · 5회 초과 | 다시 입력 / 다시 받기 — **할 일이 다름** |
+| 로그인 실패 · 탈퇴 계정 | 탈퇴는 알려야 비밀번호를 계속 다시 넣지 않음 |
+
+공통 코드(`VALIDATION_FAILED` · `AUTHENTICATION_FAILED` · `ACCESS_DENIED` 등)는
+공통 모듈 것이며 `service-template` README 7-4 에 있습니다.
+
+<br><br>
+
+---
+
+## 4. 데이터
+
+**세 곳에 나뉘어 있습니다.** 무엇을 어디에 두는지가 이 서비스 설계의 핵심입니다.
+
+| 어디 | 무엇 | 왜 거기 |
+|---|---|---|
+| PostgreSQL `auth_db` | 계정 · 로그인 이력 · 발행할 이벤트 | 영구 보관, 트랜잭션 |
+| Redis | 리프레시 토큰 · 인증 코드 · OAuth state | **TTL 로 저절로 사라지는 값.** 즉시 무효화가 필요한 값 |
+| 카프카 | `account.created` · `account.withdrawn` | 다른 서비스에 알림 |
+
+<br><br>
+
+---
+
+### 4-1. 테이블 — auth_db
+
+```
+auth_db
+├── account              계정 1행 = 사람 1명
+├── refresh_token_log    로그인 · 갱신 · 폐기 이력 (쌓기만 함)
+└── outbox               발행 대기 이벤트 (공통 모듈, V1)
+```
+
+> `processed_event`(inbox) 가 **없습니다.** auth 는 이벤트를 받지 않습니다.
+
+---
+
+**`account`**
+
+| 컬럼 | 타입 | 뜻 |
+|---|---|---|
+| `id` | uuid PK | **이 값이 `X-User-Id` 로 흐릅니다.** 다른 서비스가 전부 이것으로 사람을 가리킵니다 |
+| `email` | varchar(255) NOT NULL UNIQUE | 로그인 ID 이자 복구 수단. 탈퇴하면 `withdrawn+{id}@pawtrail.invalid` 로 치환 |
+| `password_hash` | varchar(60) | BCrypt. **소셜 계정은 NULL** |
+| `auth_provider` | varchar(12) | `LOCAL` · `GOOGLE`. 이메일 가입 뒤 구글을 연결해도 LOCAL 유지 |
+| `provider_user_id` | varchar(255) UNIQUE | 구글 `sub`. LOCAL 전용 계정은 NULL. 탈퇴하면 NULL |
+| `role` | varchar(12) | `USER` · `ADMIN`. 관리자 지정은 [7-1](#7-1-관리자-지정) |
+| `status` | varchar(12) | `ACTIVE` · `WITHDRAWN`. **`SUSPENDED` 는 없습니다** — 정지가 필요한 상황이 없음 |
+| `tokens_valid_from` | timestamp NOT NULL | **이 시각 이후 발급된 토큰만 유효.** 비밀번호 변경 · 복제 탐지 · 탈퇴 때 올림 |
+| `last_login_at` | timestamp | 마지막 로그인 |
+| `created_at` … `deleted_by` | | `BaseEntity` 6컬럼. **`deleted_at` 은 쓰지 않습니다** — 탈퇴는 `status` 하나로만 |
+
+> **`nickname` 이 없습니다.** `user_profile` 이 소유자이고 auth 는 가입 때 받아
+> 이벤트로 넘기기만 합니다.
+
+---
+
+**`refresh_token_log`**
+
+| 컬럼 | 타입 | 뜻 |
+|---|---|---|
+| `id` | uuid PK | |
+| `account_id` | uuid INDEX | 누구 것인지. FK 는 없음 |
+| `login_id` | uuid NOT NULL | **로그인 한 번을 묶는 값.** 갱신해도 옛 행에서 물려받음 |
+| `token_id` | varchar(36) UNIQUE | JWT 의 `jti`. Redis 키와 같은 값 |
+| `issued_at` · `expires_at` | timestamp | 발급 · 만료 |
+| `revoked_at` | timestamp | 로그아웃 · 갱신(옛 것) · 일괄 폐기 때 채움 |
+| `ip_address` | varchar(45) | **지금은 NULL.** nginx 를 붙일 때 채움 |
+| `user_agent` | varchar(255) | 브라우저 |
+
+**한 번의 로그인이 이렇게 쌓입니다.**
+
+```
+로그인      INSERT   login_id=L1  token_id=X
+30분 뒤 갱신  UPDATE   X 행에 revoked_at
+           INSERT   login_id=L1  token_id=Y     ← 같은 L1
+또 갱신     UPDATE   Y 행에 revoked_at
+           INSERT   login_id=L1  token_id=Z
+로그아웃     UPDATE   Z 행에 revoked_at
+```
+
+> `login_id` 가 없으면 **마지막 행의 `issued_at` 은 로그인 시각이 아니라 마지막 갱신 시각**이라
+> "언제 로그인했나" 를 알 수 없습니다. 기기가 둘이면 어느 행이 어느 로그인인지도 못 가릅니다.
+>
+> **`BaseEntity` 를 상속하지 않습니다.** `created_at` 이 `issued_at` 과 같고 `deleted_at` 이
+> `revoked_at` 과 같아 절반이 중복됩니다. 시스템이 쌓는 로그라 `outbox` 와 같은 부류입니다.
+
+---
+
+**실제 토큰은 여기 없습니다.**
+
+```
+refresh_token_log   이력만.   "언제 발급됐고 언제 죽었나"
+Redis refresh:{jti} 실물.     "지금 유효한가"
+```
+
+**즉시 무효화 때문입니다.** 로그아웃하면 Redis 키를 지우는 것으로 끝나고, DB 에는 기록만 남습니다.
+
+<br><br>
+
+---
+
+### 4-2. Redis 키 9종
+
+```
+Redis (auth 가 쓰는 것)
 │
-├── VerdictApplication.java (class)                 @EntityScan과 @EnableJpaRepositories를 쓰지 않습니다.
-│                                                   사용하면 JPA가 필수가 되어 기동에 실패합니다.
-│                                                   애노테이션과 import를 함께 지웁니다.
-│                                                   남는 것은 @SpringBootApplication 한 줄뿐입니다
+├── 토큰
+│   ├── refresh:{jti}                  accountId        14일    유효한 리프레시 토큰
+│   └── refreshgrace:{옛jti}           새 토큰 문자열    30초    로테이션 유예
+│
+├── 인증 코드 (6자리, 10분)
+│   ├── emailverify:{email}            코드             10분    가입 인증
+│   ├── emailverified:{email}          1                30분    가입 인증 통과 표시
+│   ├── pwreset:{email}                코드             10분    비밀번호 재설정
+│   └── withdraw:{email}               코드             10분    탈퇴 인증
+│       (각각 :attempt 키로 시도 횟수를 셈)
+│
+├── 발송 제한
+│   ├── mailcooldown:{용도}:{email}     1                60초    한 통 보내면 1분 대기
+│   └── mailhourly:{용도}:{email}       횟수             1시간   시간당 5통
+│       용도 = signup · pwreset · withdraw
+│
+└── OAuth
+    └── oauth:state:{state}            nonce            5분     콜백 대조용, 1회용
+```
+
+---
+
+**왜 DB 가 아니라 Redis 인가**
+
+| 값 | 이유 |
+|---|---|
+| 인증 코드 | 10분 뒤 사라져야 하는데 DB 면 지우는 배치가 필요합니다 |
+| 리프레시 토큰 | 로그아웃 = 키 삭제. DB 면 매 갱신마다 "폐기됐나" 를 조회해야 합니다 |
+| OAuth state | 5분짜리 임시 값. 테이블을 만들 이유가 없습니다 |
+
+---
+
+**직접 볼 때입니다.**
+
+```bash
+docker compose exec redis redis-cli KEYS 'refresh:*'
+docker compose exec redis redis-cli GET  'emailverified:me@example.com'
+docker compose exec redis redis-cli TTL  'pwreset:me@example.com'       # 남은 초
+```
+
+> `KEYS` 는 개발용입니다. 운영에서는 전체를 훑어 느립니다.
+
+<br><br>
+
+---
+
+### 4-3. 이벤트 2개
+
+| 이벤트 | 언제 | payload | 받는 곳 |
+|---|---|---|---|
+| `account.created` | 가입 (이메일 · 소셜 신규) | `{accountId, email, nickname}` | user → 프로필 생성 |
+| `account.withdrawn` | 탈퇴 | `{accountId}` | user · pet · report · review · notification → 각자 데이터 삭제 |
+
+---
+
+**`account.created` 만 값을 나릅니다.**
+
+다른 이벤트는 식별자만 담고 받는 쪽이 `/internal` 로 다시 읽는데, **auth 에는 `/internal`
+API 가 없고 `nickname` 은 auth 에 저장되지도 않습니다.** 그래서 이것만 예외입니다.
+
+> 소셜 가입은 `nickname: null` 로 나갑니다. 사용자가 프로필 설정에서 직접 입력합니다.
+
+---
+
+**발행은 outbox 를 거칩니다.**
+
+```
+가입 트랜잭션
+  account INSERT
+  outbox INSERT  {account.created}      ← 같은 트랜잭션
+  커밋
+    └──▶  OutboxCommitListener 가 카프카로 발행
+          실패하면 OutboxRelay 가 5초마다 재시도, 10회 넘기면 포기 → 관리자 재발행
+```
+
+**"계정은 생겼는데 프로필이 안 생기는"** 상태가 원천 차단됩니다.
+발행이 실패해도 outbox 행이 남아 있어 언젠가는 나갑니다.
+
+---
+
+**받는 이벤트는 없습니다.**
+
+auth 가 다른 서비스의 변화에 반응할 일이 없습니다. `@KafkaListener` 가 0개이고
+`processed_event` 테이블도 없습니다.
+
+<br><br>
+
+---
+
+### 4-4. Flyway 스크립트
+
+```
+db/migration/service/
+├── V20__auth.sql                              account · refresh_token_log 생성
+├── V21__add_refresh_token_id_unique.sql       token_id UNIQUE
+├── V22__add_token_revocation_and_login_id.sql tokens_valid_from · login_id
+└── V23__replace_provider_unique_index.sql     provider_user_id 단독 UNIQUE
+```
+
+| 번호 | 왜 따로 |
+|---|---|
+| V21 | `findByTokenId` 가 `Optional` 인데 중복이 들어오면 예외. **인덱스가 없어 로그아웃마다 전체 스캔이던 것도 해결** |
+| V22 | 토큰 일괄 폐기(`tokens_valid_from`)와 로그인 묶기(`login_id`). 기존 행은 `created_at` · 자기 `id` 로 채움 |
+| V23 | 소셜 연결로 같은 `sub` 가 `(LOCAL, sub)` 와 `(GOOGLE, sub)` 두 모양이 될 수 있어 복합 UNIQUE 로는 못 막음 |
+
+> **V20 을 고치지 않고 새 번호로 갑니다.** 한 번 실행된 스크립트는 체크섬이 기록돼
+> 고치면 다음 기동이 실패합니다. 규칙은 `service-template` README 4-8 에 있습니다.
+
+<br><br>
+
+---
+
+## 5. 코드 구조
+
+4계층 규칙은 `service-template` README 8장에 있습니다. **여기서는 auth 의 실제 파일이
+어디 있고 무엇을 하는지만** 봅니다.
+
+<br><br>
+
+---
+
+### 5-1. 파일 트리
+
+```
+com.pawtrail.auth
+│
+├── AuthApplication.java
 │
 ├── presentation/
-│   ├── VerdictController.java (class)              /api/v1/places/{id}/verdict — 상세 화면의 판정입니다
-│   └── VerdictInternalController.java (class)
-│                                                   /internal/verdicts/batch, /summary — 목록과 카운트
-│                                                   화면을 위해 search와 user가 호출합니다
+│   ├── controller/
+│   │   ├── AuthController              /api/v1/auth  — 가입 · 로그인 · 갱신 · 로그아웃 · /me · 비밀번호 · 탈퇴
+│   │   ├── OAuthController             /api/v1/auth/oauth  — authorize · callback
+│   │   └── AdminAccountController      /api/v1/admin/accounts  — outbox 목록 · 재발행
+│   ├── request/
+│   │   ├── SignupRequest · LoginRequest · PasswordChangeRequest
+│   │   ├── EmailVerificationRequest    한 파일에 SendCode · VerifyCode · ... 중첩 record
+│   │   └── validation/
+│   │       ├── MaxBytes                @MaxBytes(72) — 비밀번호 바이트 길이
+│   │       └── MaxBytesValidator
+│   └── support/
+│       └── ClientInfoFactory           HttpServletRequest 에서 IP · User-Agent 를 뽑음
 │
 ├── application/
-│   ├── service/VerdictService.java (class)         재료를 모으는 층입니다. policy와 pet을 호출해 가져오고
-│   │                                               RuleEngine에 넘긴 뒤 응답을 만듭니다
-│   └── dto/
+│   ├── service/                        *11개 — 아래 5-2
+│   ├── dto/
+│   │   ├── input/                      SignupInput · LoginInput · PasswordChangeInput · EmailVerifyInput
+│   │   │                               PasswordResetInput · OAuthCallbackInput · ClientInfo
+│   │   └── output/                     AccountOutput · OutboxMessageOutput
+│   └── support/
+│       ├── AfterCommitExecutor         커밋 뒤에 실행 (Redis 쓰기는 롤백이 안 되므로)
+│       └── VerificationCodeGenerator   6자리 난수
 │
 ├── domain/
 │   ├── model/
-│   │   ├── Verdict.java (record)                   판정 결과의 모양입니다
-│   │   └── Reason.java (record)                    항목별 이유와 근거입니다
-│   ├── engine/RuleEngine.java (class)              이 서비스의 핵심입니다. f(정책, 프로필) → 판정을
-│   │                                               수행합니다. 바깥을 전혀 모르는 순수 함수라 단위 테스트가
-│   │                                               쉽고, "8kg + 10kg 이하 → 가능", "안내견 단독 표기 → 불가"
-│   │                                               같은 판정 케이스를 테스트로 고정할 수 있습니다
-│   ├── exception/VerdictErrorCode.java (enum)
-│   └── provider/
-│       ├── PolicyData.java (record)                policy에서 받아올 조건 데이터의 모양입니다
-│       ├── PolicyProvider.java (interface)         조건을 가져다준다는 약속입니다
-│       ├── PetData.java (record)                   pet에서 받아올 프로필 데이터의 모양입니다
-│       └── PetProvider.java (interface)            프로필을 가져다준다는 약속입니다
+│   │   ├── Account                     계정. createLocal · createSocial · withdraw · changePassword · linkGoogle
+│   │   └── RefreshTokenLog             이력. issue · revoke
+│   ├── enums/
+│   │   ├── AuthProvider                LOCAL · GOOGLE  — hasPassword()
+│   │   └── AccountStatus               ACTIVE · WITHDRAWN
+│   ├── repository/                     *8개 — 아래 5-3
+│   ├── provider/
+│   │   ├── MailSender                  메일을 보낸다는 약속 (MailPurpose 중첩)
+│   │   └── OAuthClient                 구글에서 사용자 정보를 가져온다는 약속
+│   ├── event/payload/
+│   │   ├── AccountCreatedEvent         {accountId, email, nickname}
+│   │   └── AccountWithdrawnEvent       {accountId}
+│   └── exception/
+│       └── AuthErrorCode               16개
 │
-├── infrastructure/
-│   ├── config/RedisConfig.java (class)             판정 결과 캐시 설정입니다
-│   ├── cache/VerdictCacheStore.java (class)        캐시 키를 프로필 전체가 아니라 판정에 쓰이는 값의
-│   │                                               조합(체중, 이동장, 유모차, 견종, 접종)으로 잡습니다
-│   ├── message/kafka/consumer/
-│   │   └── VerdictCacheEvictConsumer.java (class)
-│   │                                               policy.changed와 pet.profile.updated를 받아
-│   │                                               해당 캐시를 삭제합니다
-│   └── provider/client/
-│       ├── PolicyClient.java (interface)           @HttpExchange 인터페이스입니다
-│       ├── PetClient.java (interface)              @HttpExchange 인터페이스입니다
-│       ├── PolicyProviderImpl.java (class)         domain의 PolicyProvider를 구현합니다
-│       └── PetProviderImpl.java (class)            domain의 PetProvider를 구현합니다
-│
-└── src/main/resources/application.yml
+└── infrastructure/
+    ├── config/
+    │   ├── SecurityConfig              *자기 보안 체인 — 아래 5-4
+    │   ├── JwtEncoderConfig            RS256 키 → JwtEncoder · JwtDecoder. @ConfigurationProperties 등록도 여기
+    │   ├── JwtProperties               app.jwt.*  — 비면 기동 실패
+    │   ├── AuthProperties              app.auth.* — permit-all · 유예 · 쿠키
+    │   ├── MailProperties              app.mail.*
+    │   └── OAuthProperties             app.oauth.*
+    ├── security/                       *auth 에만 있는 폴더 (템플릿에 없음)
+    │   ├── TokenProvider               토큰 발급
+    │   ├── TokenReader                 토큰 읽기 (갱신 · 로그아웃용)
+    │   ├── TokenType                   ACCESS · REFRESH — typ 값
+    │   └── CookieFactory               쿠키 만들기 · 지우기
+    ├── persistence/
+    │   ├── *RepositoryImpl · *StoreImpl   *8개 — 아래 5-3
+    │   └── jpa/
+    │       ├── AccountJpaRepository
+    │       └── RefreshTokenLogJpaRepository
+    └── provider/
+        ├── external/
+        │   ├── SmtpMailSender          Gmail SMTP
+        │   ├── GoogleOAuthClient       토큰 교환 · id_token 검증
+        │   └── dto/GoogleTokenResponse 구글 응답 형태
+        └── internal/                   (비어 있음 — 우리 서비스를 안 부름)
 
-없는 것    persistence/                                DB를 사용하지 않습니다
-           db/migration/                            테이블이 없습니다
-           domain/event/                            이벤트를 발행하지 않고 받기만 합니다
-           inbox 사용                                 아래 설명을 참고합니다
+src/main/resources/
+├── application.yml                     세 줄
+├── db/migration/service/V20 ~ V23
+└── redis/
+    ├── rotate-refresh-token.lua        갱신 — 옛 토큰 소비 · 새 토큰 활성화 · 유예 등록을 한 덩어리로
+    └── consume-withdraw-code.lua       탈퇴 — 코드가 맞을 때만 지움
 ```
 
-### 무상태 서비스는 Inbox를 사용하지 않습니다
+---
 
-InboxProcessor는 처리 이력을 DB에 남겨야 하는데 이 서비스들에는 테이블이 없습니다.
+**템플릿에 없는 것 셋입니다.**
 
-다만 문제가 되지 않습니다. 이 서비스들이 이벤트를 받아 수행하는 일이 **캐시 키 삭제**뿐이므로, 같은 이벤트를 여러 번 받아도 결과가 같습니다. 중복 방지 장치가 애초에 필요하지 않은 작업입니다.
+| 폴더 | 왜 auth 에만 |
+|---|---|
+| `infrastructure/security/` | 토큰을 **만드는** 서비스는 auth 뿐. 다른 13개는 헤더만 읽음 |
+| `presentation/request/validation/` | `@MaxBytes` 가 필요한 곳이 지금은 여기뿐 |
+| `resources/redis/` | Lua 스크립트. 여러 키를 원자적으로 다뤄야 하는 곳이 auth 에 둘 |
 
 ---
 
-## 9. 서비스별 형태 분류
+**비어 있는 것입니다.**
 
-도메인 서비스는 14개입니다. 플랫폼 3개를 합쳐 17개입니다.
+| 폴더 | 왜 |
+|---|---|
+| `domain/rule/` | 엔티티에 붙지 않는 판단이 없음. 규칙이 전부 `Account` 메서드 안에 있음 |
+| `domain/event/` (인터페이스) | 판단 없이 그대로 발행하므로 `OutboxEventRecorder` 를 직접 씀 |
+| `infrastructure/provider/internal/` | **우리 서비스를 한 번도 안 부름** |
+| `infrastructure/message/kafka/` | 발행은 공통 모듈이 하고, 받는 것은 없음 |
 
-| 구분 | 서비스 | 소유 DB |
-|---|---|---|
-| **DB 있음** | auth | auth_db |
-| | user | user_db |
-| | pet | pet_db |
-| | place | place_db (동물병원 포함) |
-| | policy | policy_db |
-| | search | search_db (검색 색인) |
-| | ingest | raw_db |
-| | report | report_db (제보) |
-| | review | review_db (방문 후기) |
-| | notification | notif_db |
-| **DB 없음** | verdict | 무상태 순수 계산 |
-| | congestion | Redis 캐시만 사용 |
-| | route | 카카오맵 경로 계산만 수행합니다 |
-| **별도 판단** | extract | 소유 DB 없이 /internal API로만 접근합니다. 다만 Spring Batch가 실행 이력 테이블을 요구하므로 이 부분만 별도로 정합니다 |
-| **다른 형태** | gateway / config / eureka | 도메인 서비스가 아니므로 4계층 구조를 따르지 않습니다 |
-
-**report 와 review 를 나눈 이유** — 제보는 쓰기 한 번에 조회는 관리자만 하는 콜드패스이고, 후기는 장소 상세를 열 때마다 조회되며 표시 방식이 자주 바뀝니다. 변경 이유와 부하 성격이 모두 다릅니다.
-
-**route 에 DB 가 없는 이유** — 동물병원이 place 로 편입되어 `vet_db` 가 사라졌습니다. 남은 일은 카카오맵 경로 계산뿐이지만, congestion 과 합치면 카카오맵 장애가 집중률까지 끊으므로 서비스는 분리해 둡니다.
-
-### 이벤트 발행·수신 현황
-
-이벤트는 **5개뿐입니다.** 이 표가 토픽 이름의 단일 참조이므로, 발행하는 쪽과 받는 쪽이 같은 문자열을 쓰는지 여기서 확인합니다.
-
-| 서비스 | outbox (발행) | inbox (수신) |
-|---|---|---|
-| auth | account.withdrawn | — |
-| place | place.updated | — |
-| policy | policy.changed | — |
-| pet | pet.profile.updated | account.withdrawn |
-| report | report.reviewed | account.withdrawn |
-| review | — | account.withdrawn |
-| user | — | account.withdrawn |
-| search | — | place.updated |
-| notification | — | policy.changed, report.reviewed, account.withdrawn |
-| verdict | — | policy.changed, pet.profile.updated (inbox 미사용) |
-| ingest / extract / congestion / route | — | — |
-
-| 이벤트 | 무엇을 알리는가 | payload |
-|---|---|---|
-| `place.updated` | 장소 정보가 바뀌어 색인이 낡았습니다 | `{placeId}` |
-| `policy.changed` | 동반 조건이 바뀌어 알림 대상과 판정 캐시가 낡았습니다 | `{placeId, policyVersion, changedFields[], hasConflict}` |
-| `pet.profile.updated` | 반려동물 정보가 바뀌어 판정 캐시가 낡았습니다 | `{petId, accountId, verdictRelevantChanged}` |
-| `account.withdrawn` | 탈퇴했으므로 각자 가진 사용자 데이터를 지워야 합니다 | `{accountId}` |
-| `report.reviewed` | 제보 처리가 끝나 제보자에게 알려야 합니다 | `{reportId, accountId, status, memo}` |
-
-#### 이벤트로 만들지 않는 것
-
-같은 사실을 전달하더라도 아래에 해당하면 이벤트가 아니라 동기 호출이나 배치로 처리합니다.
-
-| 판단 기준 | 예 → 동기 호출 | 아니오 → 이벤트 |
-|---|---|---|
-| 호출자가 결과를 기다리는가 | 검색은 판정을 받아야 응답합니다 | 색인이 언제 갱신되든 무방합니다 |
-| 응답을 실제로 쓰는가 | verdict 가 policy 조건을 씁니다 | 알림은 발행자가 결과를 보지 않습니다 |
-| 실패를 즉시 알아야 하는가 | 저장이 실패하면 청크를 재시도합니다 | 나중에 재시도해도 됩니다 |
-| 상대가 죽었으면 실패해야 하는가 | policy 가 죽으면 판정이 불가합니다 | search 가 죽어도 나중에 하면 됩니다 |
-| 소비자를 알아야 하는가 | 특정 서비스를 지목해 호출합니다 | 누가 받든 상관없습니다 |
-
-한 줄로 줄이면 **"내가 무엇을 했다"가 아니라 "네가 가진 것이 낡았다"를 알리는 것만 이벤트**입니다.
-
-수집·추출 파이프라인(`ingest → place`, `extract → policy`)을 이벤트로 잇지 않는 이유도 여기에 있습니다. 청크 단위로 실패를 롤백해야 하고, **데이터 갱신은 사람의 승인을 거쳐 실행**하기로 했기 때문입니다. 이벤트로 자동 연쇄시키면 그 승인 단계가 사라집니다.
-
-#### 토픽 이름은 공통 모듈에 두지 않습니다
-
-발행하는 쪽은 `DomainEvent.getTopic()` 이 반환하고, 받는 쪽은 `@KafkaListener(topics = ...)` 에 적습니다. **같은 문자열이 두 레포에 각각 존재합니다.**
-
-공통 모듈에 상수로 두지 않는 이유는, 토픽은 개발 도중 추가·변경·삭제될 수 있는데 공통 모듈에 있으면 그때마다 재배포와 전 서비스 버전업이 필요하기 때문입니다. 공통 모듈의 기준은 "거의 바뀌지 않는 것"입니다.
-
-대신 **문자열이 어긋나면 오류 없이 이벤트만 오지 않습니다.** 위 표를 참조해 정확히 적고, 실물 확인은 Kafka UI(`tools` 프로파일, 9000 포트)에서 토픽에 메시지가 쌓였는지로 합니다.
+<br><br>
 
 ---
 
-## 10. Spring Boot 4 에서 달라진 것
+### 5-2. 서비스 클래스 11개 — 누가 무엇을 하나
 
-### 10-1. 애노테이션 패키지 이동
+```
+[ 누가 누구를 부르나 ]
 
-`@EntityScan` 의 패키지가 바뀌었습니다. 옛 경로로 import 하면 `package ... does not exist` 오류가 납니다.
+AuthController ──────┬──▶  EmailVerificationService    가입 인증 코드
+                     ├──▶  AuthService                 signup · login
+                     │        └──▶  TokenIssueService   토큰 2개 발급 · Redis · 이력   (login 이 씀)
+                     ├──▶  RefreshService              갱신 (Lua rotate)
+                     │        └──▶  TokenRevokeService  복제 탐지 시 전부 폐기 (REQUIRES_NEW)
+                     ├──▶  LogoutService               로그아웃
+                     ├──▶  AccountService              /me · 비밀번호 변경
+                     │        └──▶  TokenRevokeService  변경 후 전부 폐기 (REQUIRED)
+                     ├──▶  PasswordResetService        재설정 코드 · 재설정
+                     │        └──▶  TokenRevokeService  재설정 후 전부 폐기 (REQUIRED)
+                     └──▶  WithdrawService             탈퇴 코드 · 탈퇴
+                              └──▶  TokenRevokeService
+
+OAuthController ─────▶  OAuthLoginService             authorize · callback
+                              └──▶  TokenIssueService   AuthService.login 과 같은 것을 씀
+
+AdminAccountController ▶  AdminOutboxService           목록 · 재발행
+```
+
+---
+
+| 서비스 | 하는 일 | 트랜잭션 |
+|---|---|---|
+| `EmailVerificationService` | 가입 인증 코드 발송 · 확인 | 없음 (Redis 만) |
+| `AuthService` | `signup` · `login` | `@Transactional` |
+| `TokenIssueService` | 토큰 2개 발급 · Redis 저장 · 이력 · `last_login_at` | `MANDATORY` — 부르는 쪽에 묶여야 함 |
+| `RefreshService` | 갱신 · 로테이션 · 복제 탐지 | `@Transactional` |
+| `LogoutService` | Redis 삭제 · 이력 `revoked_at` | `@Transactional` |
+| `AccountService` | `/me` · 비밀번호 변경 | `@Transactional` |
+| `PasswordResetService` | 재설정 코드 · 재설정 | `@Transactional` |
+| `WithdrawService` | 탈퇴 코드 · 탈퇴 · 이벤트 | `@Transactional` |
+| `TokenRevokeService` | 계정의 토큰 전부 폐기 | **진입점 둘** — 아래 |
+| `OAuthLoginService` | authorize · callback · 계정 매칭 | `@Transactional` |
+| `AdminOutboxService` | 포기한 이벤트 목록 · 재발행 | 조회는 `readOnly` |
+
+---
+
+**`AuthService` 와 `AccountService` 를 나눈 기준입니다.**
+
+| | 받는 것 | 하는 일 |
+|---|---|---|
+| `AuthService` | 이메일 · 비밀번호 | **"내가 누구인지 증명"** — 가입 · 로그인 |
+| `AccountService` | 계정 ID (헤더에서) | **"이미 증명한 사람이 자기 것을 다룸"** — 조회 · 변경 |
+
+---
+
+**`TokenRevokeService` 에 진입점이 둘인 이유입니다.**
 
 ```java
-// Spring Boot 3 (이제 존재하지 않습니다)
-import org.springframework.boot.autoconfigure.domain.EntityScan;
-
-// Spring Boot 4
-import org.springframework.boot.persistence.autoconfigure.EntityScan;
+revokeAllInNewTransaction()   REQUIRES_NEW   복제 탐지용 — 부른 뒤 예외를 던져야 하므로 먼저 커밋
+revokeAll()                   REQUIRED       비밀번호 변경 · 재설정 · 탈퇴 — 같은 트랜잭션에서
 ```
 
-### 10-2. 스타터 이름 변경
+```
+복제 탐지                             비밀번호 변경
+  폐기 → 401 예외                       폐기 → 계속 진행 → 200
+  같은 트랜잭션이면 예외로 롤백돼          REQUIRES_NEW 면 바깥이 들고 있던 낡은 Account 가
+  폐기가 없던 일이 됨                     tokens_valid_from 을 옛 값으로 덮어씀
+  → REQUIRES_NEW 로 먼저 커밋            → REQUIRED 로 같은 인스턴스를 씀
+```
 
-Spring Boot 4 에서 코드베이스가 모듈 단위로 나뉘면서 스타터 이름도 바뀌었습니다. 옛 이름도 아직 해석되지만 새 이름을 씁니다.
+> **별도 클래스여야 합니다.** 같은 클래스 안에서 부르면 프록시를 안 거쳐 전파 설정이 무시됩니다.
 
-| Spring Boot 3 | Spring Boot 4 |
+<br><br>
+
+---
+
+### 5-3. 저장소 8개 — 약속과 구현
+
+| 약속 (`domain/repository`) | 구현 (`infrastructure/persistence`) | 저장소 | 무엇을 |
+|---|---|---|---|
+| `AccountRepository` | `AccountRepositoryImpl` → `AccountJpaRepository` | PostgreSQL | 계정 |
+| `RefreshTokenLogRepository` | `…Impl` → `RefreshTokenLogJpaRepository` | PostgreSQL | 이력. `revokeAllActive` 는 벌크 UPDATE |
+| `RefreshTokenStore` | `RefreshTokenStoreImpl` | Redis | `save` · `rotate`(Lua) · `findGrace` · `claim` |
+| `EmailVerificationStore` | `…Impl` | Redis | 가입 인증 코드 · 통과 표시 |
+| `PasswordResetStore` | `…Impl` | Redis | 재설정 코드 |
+| `WithdrawStore` | `…Impl` | Redis | 탈퇴 코드. `consume` 은 Lua |
+| `SendRateLimitStore` | `…Impl` | Redis | 발송 제한. `tryAcquire` · `recordSent` · `release` |
+| `OAuthStateStore` | `…Impl` | Redis | state → nonce |
+
+> **Redis 도 JPA 와 똑같이 약속과 구현으로 나눕니다.** 서비스는 `RedisTemplate` 을 모릅니다.
+> `XxxStore` 가 Redis, `XxxRepository` 가 JPA 라는 것이 이름 규칙입니다.
+
+---
+
+**Lua 를 쓰는 곳 둘입니다.**
+
+| 스크립트 | 왜 Lua |
 |---|---|
-| `spring-boot-starter-web` | `spring-boot-starter-webmvc` |
-| `org.flywaydb:flyway-core` 직접 추가 | `spring-boot-starter-flyway` |
-| `org.springframework.kafka:spring-kafka` | `spring-boot-starter-kafka` |
-| micrometer 브리지 + zipkin-reporter 조합 | `spring-boot-starter-zipkin` |
-| `spring-boot-starter-test` 하나 | `-webmvc-test`, `-data-jpa-test` 등 모듈별로 분리 |
+| `rotate-refresh-token.lua` | 키 셋(옛 토큰 · 새 토큰 · 유예)을 **한 덩어리로** 바꿔야 합니다. 나누면 그 사이에 들어온 요청이 활성화 안 된 토큰을 받아 갑니다 |
+| `consume-withdraw-code.lua` | 코드가 **맞을 때만** 지워야 합니다. `GETDEL` 은 값을 안 보고 지워 오타 한 번에 진짜 코드가 사라집니다 |
 
-Flyway 는 스타터로 넣어야 Hibernate 의 스키마 검증보다 먼저 실행됩니다. `flyway-core` 만 직접 넣으면 검증이 먼저 돌아 테이블이 없다는 오류가 납니다.
+```lua
+-- rotate-refresh-token.lua
+local accountId = redis.call('GETDEL', KEYS[1])            -- refresh:{옛jti}   소비
+if not accountId then return false end                     -- 이미 없으면 → 복제 또는 경합
+redis.call('SET', KEYS[2], accountId, 'EX', ARGV[1])       -- refresh:{새jti}   활성화
+redis.call('SET', KEYS[3], ARGV[2], 'EX', ARGV[3])         -- refreshgrace:{옛jti}
+return accountId
+```
 
-### 10-3. 설정 프로퍼티 경로 이동
+<br><br>
 
-추적 관련 프로퍼티가 옮겨졌습니다. **옛 경로를 써도 오류가 나지 않고 조용히 무시됩니다.** Zipkin 을 띄웠는데 트레이스가 하나도 들어오지 않는다면 이 부분을 확인합니다.
+---
 
-| Spring Boot 3 | Spring Boot 4 |
+### 5-4. 보안 설정 — 왜 자기 체인을 정의하나
+
+공통 모듈은 **모든 요청에 인증을 요구하는** 기본 체인을 줍니다. 그런데 auth 는
+로그인·가입처럼 **인증 없이 열어야 하는 경로가 9개** 있습니다. 그래서 자기 체인을 만듭니다.
+
+```
+요청  ──▶  SecurityFilterChain (auth 가 직접 정의)
+              │
+              ├──▶  HeaderAuthenticationFilter        X-User-Id · X-User-Role 를 읽어 SecurityContext 를 채움
+              │                                       (공통 모듈 것. 자기 체인이라 직접 등록함)
+              │
+              ├──▶  경로 규칙
+              │       /internal/** · /actuator/**     permitAll
+              │       app.auth.permit-all 9줄          permitAll     ← config 에서 읽음
+              │       /api/v1/admin/**                hasRole(ADMIN)
+              │       그 밖의 전부                     authenticated
+              │
+              ├──▶  csrf · formLogin · httpBasic 끔    쿠키 + 헤더 방식이라 스프링 로그인 폼을 안 씀
+              ├──▶  세션 STATELESS                     JWT 라 세션을 안 만듦
+              └──▶  401 · 403 을 CustomSecurityExceptionHandler 로   공통 응답 형식
+```
+
+---
+
+**자기 체인을 정의하면 공통 모듈 것이 통째로 물러납니다.**
+
+그래서 공통 체인이 하던 일을 **전부 다시 넣어야 합니다.**
+
+| 다시 넣은 것 | 빠뜨리면 |
 |---|---|
-| `management.zipkin.tracing.endpoint` | `management.tracing.export.zipkin.endpoint` |
+| `HeaderAuthenticationFilter` | `GET /me` 가 누구인지 모름 → 전부 401 |
+| `/api/v1/admin/**` → `hasRole("ADMIN")` | 관리자 API 가 USER 에게 열림 (게이트웨이가 한 번 막지만 이중화가 반쪽) |
+| `/internal/** · /actuator/**` permitAll | 헬스체크가 401 |
+| `CustomSecurityExceptionHandler` | 401·403 응답이 공통 형식이 아니게 됨 |
+| `AuthenticationManager` 빈 | 기동 로그에 `Using generated security password` 가 찍힘 (공통 모듈 0.0.7 이 처리) |
 
-### 10-4. 카프카 추적은 따로 켜야 합니다
+> **`permit-all` 목록을 config 에서 읽는 이유** — 게이트웨이도 그렇게 하고 있어서입니다.
+> 같은 목록이 두 곳에 있는데 한쪽만 코드에 박혀 있으면 고칠 때 빠뜨리기 쉽습니다.
+> 설정을 못 받으면 목록이 비어 **전부 401** 이 되는데, 그것을 *"열 경로가 없다"* 가 아니라
+> *"설정을 못 받았다"* 로 보고 **기동 시점에 막습니다.**
 
-Spring Boot 4 의 변경점은 아니지만 같은 자리에서 막히므로 함께 적습니다. 스프링 카프카는 Observation 이 **기본으로 꺼져 있습니다.** 켜지 않으면 HTTP 구간까지는 트레이스가 이어지다가 **이벤트를 건너가는 순간 끊깁니다.** 받는 서비스는 새 트레이스를 시작하고, 오류는 나지 않습니다.
+<br><br>
+
+---
+
+## 6. 설정값
+
+설정 4계층 규칙은 `service-template` README 6장에 있습니다.
+**auth 가 쓰는 값이 무엇이고 어디 있는지만** 봅니다.
+
+<br><br>
+
+---
+
+### 6-1. config 저장소의 auth-service.yml
 
 ```yaml
+# 2계층 — auth-service.yml   (모든 환경 공통)
+server:
+  port: 8081
+
 spring:
-  kafka:
-    template:
-      observation-enabled: true
-    listener:
-      observation-enabled: true
+  datasource:
+    url: jdbc:postgresql://${app.datasource.host}:5432/auth_db
+    username: auth_svc
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: pawtrail.noreply@gmail.com
+    password: ${AUTH_MAIL_PASSWORD}                    # ← 환경변수
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 5000
+      mail.smtp.writetimeout: 5000
+
+app:
+  outbox:
+    relay:
+      enabled: true                                     # 이벤트를 발행하므로
+
+  jwt:
+    issuer: pawtrail-auth
+    private-key-b64: ${AUTH_JWT_PRIVATE_KEY_B64}        # ← 환경변수
+    access-expiry: 30m
+    refresh-expiry: 14d
+    claim:
+      account-id: sub
+      role: role
+      type: typ
+
+  auth:
+    permit-all:                                         # 게이트웨이와 같은 9줄
+      - /api/v1/auth/signup
+      - /api/v1/auth/login
+      - /api/v1/auth/refresh
+      - /api/v1/auth/logout
+      - /api/v1/auth/oauth/**
+      - /api/v1/auth/password/reset-request
+      - /api/v1/auth/password/reset
+      - /api/v1/auth/email/verify-request
+      - /api/v1/auth/email/verify
+    rotation-grace: 30s
+    cookie:
+      domain: ""
+      refresh-path: /api/v1/auth
+
+  mail:
+    from: pawtrail.noreply@gmail.com
+
+  oauth:
+    google:
+      client-id: 1234567890-abc.apps.googleusercontent.com   # 비밀 아님
+      client-secret: ${AUTH_OAUTH_GOOGLE_CLIENT_SECRET}      # ← 환경변수
 ```
 
-프로듀서만 켜면 헤더는 실려 가지만 컨슈머가 읽지 않아 반쪽입니다. **둘 다 켭니다.** 템플릿의 `application.yml` 에 이미 들어 있습니다.
+```yaml
+# 3계층 — application-local.yml   (local 만)
+app:
+  auth:
+    cookie:
+      secure: false                    # http://localhost 라 Secure 를 못 씀
+  oauth:
+    frontend-base-url: http://localhost:5173
+    google:
+      redirect-uri: http://localhost:8080/api/v1/auth/oauth/google/callback
+```
 
-Outbox 를 쓰므로 원 HTTP 요청과 발행 구간이 항상 이어지지는 않습니다. 커밋 직후 즉시 발행은 다른 스레드에서 일어나고, `OutboxRelay` 가 회수한 건은 스케줄러 스레드라 원 요청과 연결할 방법이 없습니다. Observation 이 보장하는 것은 **발행부터 소비까지**입니다.
+```yaml
+# 3계층 — application-dev.yml · application-prod.yml
+app:
+  auth:
+    cookie:
+      secure: true
+```
 
-### 10-5. Spring Cloud Gateway 아티팩트명 변경
+---
 
-게이트웨이를 다루게 될 때 필요한 내용입니다.
+**환경마다 다른 값 셋입니다.**
 
-| 이전 | 현재 |
+| 값 | local | dev · prod |
+|---|---|---|
+| `cookie.secure` | `false` | `true` |
+| `frontend-base-url` | `http://localhost:5173` | `https://<도메인>` |
+| `redirect-uri` | `http://localhost:8080/...` | `https://<도메인>/...` |
+
+> `cookie.secure` 에 **2계층 기본값을 두지 않습니다.** 두면 3계층을 안 만든 환경에서
+> 조용히 그 값으로 도는데, `false` 면 배포가 위험하고 `true` 면 로컬이 안 됩니다.
+> 없으면 기동 시점에 터지는 편이 낫습니다.
+
+<br><br>
+
+---
+
+### 6-2. 환경변수와 config 가 갈리는 기준
+
+| | config 저장소 (공개) | 환경변수 |
+|---|---|---|
+| 개인키 | | ✓ 새면 누구나 토큰을 위조 |
+| 공개키 | ✓ (게이트웨이 것) | |
+| 구글 클라이언트 ID | ✓ 주소창에 그대로 뜨는 값 | |
+| 구글 클라이언트 시크릿 | | ✓ |
+| Gmail 앱 비밀번호 | | ✓ |
+| DB 비밀번호 | | ✓ |
+| DB 호스트 | | ✓ 사람마다 다름 (`localhost` / EC2) |
+| 만료 시간 · 유예 · 경로 | ✓ | |
+
+**기준은 "새면 무엇을 할 수 있나" 입니다.** 확인만 되고 만들 수는 없는 값(공개키 · 클라이언트 ID)은
+공개돼도 무해하므로 config 에 둡니다.
+
+> **`${SERVICE_DB_PASSWORD:1234}` 처럼 기본값을 박지 않습니다.** 환경변수를 빠뜨려도
+> 붙어 버려 누락이 영영 안 드러납니다.
+
+<br><br>
+
+---
+
+### 6-3. 검증이 걸린 값 — 비면 기동이 안 됩니다
+
+`JwtProperties` · `AuthProperties` 가 **컴팩트 생성자에서 검증합니다.**
+
+| 클래스 | 검증하는 것 | 왜 비면 안 되나 |
+|---|---|---|
+| `JwtProperties` | `issuer` · `privateKeyB64` | 토큰을 못 만듦 |
+| | `accessExpiry` · `refreshExpiry` > 0 | `0s` 면 발급 즉시 만료. Lua 의 `EX 0` 이 오류 |
+| | `claim.accountId` · `role` · `type` | **빈 문자열이 null 보다 위험** — 이름 없는 항목이 든 토큰이 만들어지고 게이트웨이가 401 만 냄 |
+| `AuthProperties` | `permitAll` 비어 있지 않음 | 비면 로그인이 401. "열 경로가 없다" 가 아니라 "설정을 못 받았다" |
+| | `cookie.refreshPath` | null 이면 Path 가 안 붙어 **로그아웃해도 쿠키가 안 지워짐** |
+
+---
+
+**값을 새로 넣거나 검증을 추가하면 세 곳을 같이 봅니다.**
+
+```
+config/auth-service.yml                          실제 값
+auth-service/src/test/resources/application.yml  테스트용 사본   ← 놓치기 쉬움
+JwtProperties · AuthProperties                   검증
+```
+
+> **테스트는 설정 서버를 꺼서 config 값이 하나도 안 내려옵니다.** config 에만 넣고
+> 테스트 yml 을 안 고치면 `contextLoads` 가 검증에 걸려 빌드가 실패합니다.
+> 실제로 `app.jwt.claim.type` 을 넣을 때 그랬습니다.
+
+---
+
+**테스트 yml 의 RSA 키는 따로 만든 것입니다.**
+
+실제 서명 키를 공개 저장소에 커밋하지 않으려고 **테스트 전용 키**를 씁니다.
+그 키로 만든 토큰을 받아 주는 서버가 없어 공개돼도 무해합니다.
+
+<br><br>
+
+---
+
+## 7. 운영
+
+<br><br>
+
+---
+
+### 7-1. 관리자 지정
+
+**관리자 API 가 없습니다.** DB 에서 직접 바꿉니다.
+
+**macOS · Windows 공통**
+
+```bash
+docker compose exec postgres psql -U auth_svc -d auth_db -c \
+  "UPDATE account SET role = 'ADMIN' WHERE email = 'me@example.com';"
+
+docker compose exec postgres psql -U auth_svc -d auth_db -c \
+  "SELECT email, role FROM account WHERE role = 'ADMIN';"
+```
+
+> **바꾼 뒤 반드시 다시 로그인합니다.** 토큰 안의 `role` 은 발급 시점 값이라
+> 옛 쿠키로는 여전히 `USER` 로 나가 403 이 납니다.
+
+---
+
+**Flyway 로 하지 않는 이유입니다.**
+
+| Flyway | psql |
 |---|---|
-| `spring-cloud-starter-gateway` | `spring-cloud-starter-gateway-server-webflux` |
-| `spring-cloud-starter-gateway-mvc` | `spring-cloud-starter-gateway-server-webmvc` |
+| 모든 환경에서 똑같이 실행됨. **계정 UUID 는 환경마다 다름** | 환경마다 사람이 한 번 |
+| 한 번 적용되면 못 고침. 관리자를 바꿀 때마다 V24 · V25 가 쌓임 | 흔적이 안 남음 |
+| **스키마 이력에 운영 기록이 섞임** | |
 
-프로퍼티 접두사도 `spring.cloud.gateway.server.webflux.*` 형태로 바뀌었습니다. **옛 접두사를 쓰면 오류 없이 무시되므로** 설정이 안 먹을 때 이 부분을 확인합니다.
+`REVOKE CONNECT` 같은 것은 *"DB 를 세울 때마다 반드시"* 라 init 스크립트에 있고,
+관리자 지정은 *"사람이 판단해 환경마다 한 번"* 이라 손으로 합니다.
+
+<br><br>
+
+---
+
+### 7-2. 관리자 API 부르기
+
+**반드시 게이트웨이(`:8080`)를 거칩니다.** `X-User-Role: ADMIN` 헤더는 게이트웨이만 넣어 줍니다.
+
+```
+8081 직결          401   auth 가 냄.   traceId 있음
+8080 · USER       403   게이트웨이가 냄. traceId null    ← 게이트웨이가 먼저 막음
+8080 · ADMIN      200
+```
+
+> `traceId` 로 **어느 층이 막았는지** 알 수 있습니다. 게이트웨이가 만든 응답은
+> 도메인 서비스까지 안 가서 `traceId` 가 `null` 입니다.
+
+---
+
+**curl 로**
+
+```bash
+# ADMIN 계정으로 로그인해 쿠키를 받은 뒤
+curl -b cookies.txt http://localhost:8080/api/v1/admin/accounts/outbox
+curl -b cookies.txt -X POST http://localhost:8080/api/v1/admin/accounts/outbox/{id}/retry
+```
+
+**브라우저 콘솔로**
+
+```
+① http://localhost:8080/api/v1/auth/me 를 연다   ← 반드시 8080 페이지에서
+② F12 → Console
+③ allow pasting 을 직접 타이핑 (붙여넣기 잠금 해제)
+④ fetch('/api/v1/admin/accounts/outbox').then(r => r.json()).then(console.log)
+```
+
+> **8080 이 아닌 페이지에서 열면 상대 경로가 그 출처로 나갑니다.** 프론트가 없어
+> `/login/success` 는 오류 페이지가 되고 거기서 열면 `chrome-error://` 로 붙어 실패합니다.
+
+---
+
+**Swagger 로는 부를 수 없습니다.**
+
+Swagger UI 는 `:8081` 에서 뜨고 **Try it out 도 8081 로 쏩니다.** 게이트웨이를 안 거쳐
+헤더가 없으므로 401 입니다. 관리자 화면은 프론트에 만듭니다.
+
+<br><br>
+
+---
+
+### 7-3. 이벤트를 다시 보내야 할 때
+
+```
+① GET /api/v1/admin/accounts/outbox 로 목록 확인
+        │
+        ├── 비어 있음   →  문제 없음. 끝
+        │
+        └── 있음  →  lastError 를 봄
+                       TimeoutException     →  ② 카프카가 살아 있는지 확인하고 retry
+                       직렬화 · 코드 오류     →  코드를 먼저 고치고 배포한 뒤 retry
+```
+
+---
+
+**직접 확인할 때입니다.**
+
+```bash
+# 포기한 건 (retry_count 10 이상, 미발행)
+docker compose exec postgres psql -U auth_svc -d auth_db -P pager=off -c \
+  "SELECT id, topic, retry_count, last_error, created_at
+   FROM outbox WHERE published_at IS NULL ORDER BY created_at;"
+
+# 카프카에 실제로 들어갔는지
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic account.created --from-beginning --max-messages 5
+```
+
+> `-P pager=off` 가 없으면 결과가 넓을 때 **멈춘 것처럼 보입니다.**
+> Kafka UI(`tools` 프로파일, `:9000`)로 보는 편이 편합니다.
+
+---
+
+**`retry_count` 를 손으로 올려 테스트할 때는 auth 를 내립니다.**
+
+발행 중인 행에 `FOR UPDATE SKIP LOCKED` 잠금이 걸려 있어 **auth 가 떠 있으면 UPDATE 가
+잠금 대기로 멈춥니다.** 잠깐 내리고 하면 즉시 됩니다.
+
+<br><br>
+
+---
+
+### 7-4. 키 페어를 새로 만들 때
+
+**로컬 키가 노출됐거나 배포용 키를 만들 때**입니다.
+
+**macOS**
+
+```bash
+mkdir -p ~/pawtrail-keys && cd ~/pawtrail-keys
+openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
+openssl rsa -in private.pem -pubout -out public.pem
+
+# 개인키 → Base64 한 줄 → 클립보드
+base64 -i private.pem | tr -d '\n' | pbcopy
+```
+
+**Windows (PowerShell)**
+
+```powershell
+mkdir C:\Tour_Prj\pawtrail-keys; cd C:\Tour_Prj\pawtrail-keys
+openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
+openssl rsa -in private.pem -pubout -out public.pem
+
+# 개인키 → Base64 한 줄 → 클립보드
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("private.pem")) | Set-Clipboard
+```
+
+---
+
+**갈아야 하는 곳이 둘입니다.**
+
+| 무엇 | 어디 | 어떻게 |
+|---|---|---|
+| 개인키 | 환경변수 `AUTH_JWT_PRIVATE_KEY_B64` | 클립보드 값을 붙임. **팀원 전원** |
+| 공개키 | config `gateway-server.yml` 의 `app.jwt.public-key` | `public.pem` 내용을 블록 스칼라로. **들여쓰기 주의** |
+
+```yaml
+# config/gateway-server.yml
+app:
+  jwt:
+    public-key: |
+      -----BEGIN PUBLIC KEY-----
+      MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...
+      -----END PUBLIC KEY-----
+```
+
+> **짝이 어긋나면 전 요청이 401 이 됩니다.** 둘을 같이 바꾸고 게이트웨이를 재시작합니다.
+> 기존 로그인은 전부 풀립니다 — 옛 키로 서명된 토큰이라 새 공개키로 검증이 안 됩니다.
+>
+> **키 값을 채팅에 붙여넣지 않습니다.** 클립보드로 환경변수에 바로 넣고 "넣었다" 만 알립니다.
+> 값이 맞는지는 빌드와 로그인이 알려 줍니다.
+
+<br><br>
+
+---
+
+### 7-5. 배포 순서 — auth 를 먼저
+
+**auth 와 게이트웨이를 함께 바꿀 때 순서가 있습니다.**
+
+```
+① auth 배포             새 토큰에 typ 이 들어감
+        │
+        ▼
+② 30분 기다림           옛 액세스 토큰(typ 없음)이 전부 만료됨
+        │
+        ▼
+③ 게이트웨이 배포        typ 검사가 켜짐
+```
+
+> 반대로 하면 **②가 지나기 전에 발급된 토큰이 전부 401** 이 됩니다.
+> 지금은 로컬뿐이라 문제가 없지만 **배포에서 처음 겪을 자리**입니다.
+
+---
+
+**배포용으로 바꾸는 것입니다.**
+
+| 무엇 | 로컬 | 배포 |
+|---|---|---|
+| RS256 키 | 로컬 쌍 | **새 쌍** — 로컬 개인키가 각자 컴퓨터에 돌아다니므로 |
+| `redirect-uri` | `http://localhost:8080/...` | `https://<도메인>/...` — **구글은 IP 와 HTTP 를 거부** |
+| `frontend-base-url` | `http://localhost:5173` | `https://<도메인>` |
+| 구글 앱 상태 | Testing (등록된 사용자만) | **게시** — 안 하면 심사위원이 로그인 못 함 |
+| springdoc | 켜짐 | **끔** — API 목록이 바깥에 노출됨 |
+
+<br><br>
+
+---
+
+## 8. 왜 이렇게 만들었나
+
+**코드를 고치기 전에 읽으면 "이거 왜 이렇게 돼 있지" 가 줄어듭니다.**
+각 항목은 문제 → 고른 것 → 버린 것 순서입니다.
+
+<br><br>
+
+---
+
+### 8-1. 인증 방식
+
+**Keycloak 같은 기성품을 안 쓴 이유**
+
+| 고름 | 버림 |
+|---|---|
+| 직접 구현 | Keycloak |
+| auth 가 얇은 프록시로 전락하지 않음 | Keycloak DB 가 따로 관리됨. 토큰을 바디로 주므로 쿠키로 바꿔 심는 래퍼가 필요 |
+| 이 프로젝트의 승부처(판정 · MSA 경계 · 배포)에 인증이 없어 시간을 쓸 이유가 약함 | 리프레시 토큰 Redis 와 Keycloak 세션이 겹쳐 관리 주체가 둘 |
+
+---
+
+**액세스 토큰을 쿠키에 두는 이유**
+
+`localStorage` 는 XSS 에 통째로 털리고, 쿠키는 `SameSite=Strict` 로 CSRF 를 막습니다.
+nginx 가 프론트와 API 를 같은 도메인으로 서빙해 `Strict` 를 쓸 수 있습니다.
+
+---
+
+**서비스 간 호출에 토큰을 안 붙이는 이유**
+
+VPC 내부망 + 보안그룹 격리로 갑니다. 제로 트러스트로 가면 서비스마다 토큰 발급·검증이
+붙어 복잡도가 급증합니다. 이 규모에서는 부적합하다고 판단했습니다.
+
+---
+
+**JWT 라이브러리가 `spring-security-oauth2-jose` 인 이유**
+
+| 고름 | 버림 |
+|---|---|
+| `NimbusJwtEncoder` | JJWT |
+| **게이트웨이가 같은 라이브러리로 검증**하고 있어 알고리즘·형식이 어긋날 여지가 적음 | API 가 간결하지만 `jjwt-jackson` 이 Jackson 2 를 끌고 옴. 우리는 Boot 4 + Jackson 3 |
+
+<br><br>
+
+---
+
+### 8-2. 토큰
+
+**리프레시 토큰도 JWT 인 이유**
+
+`jti` 가 필요한데 JWT 는 그것이 규격에 있는 자리이고, 만료를 토큰이 들고 있어
+**Redis 가 날아가도 만료된 토큰은 통하지 않습니다.**
+
+---
+
+**`sub` · `role` 이라는 claim 이름**
+
+`sub` 는 JWT 규격(RFC 7519)의 표준 항목이라 `Jwt.getSubject()` 와 로깅 도구가 그 자리를 봅니다.
+`accountId` 로 바꾸면 이름은 명확하지만 표준 자리를 비워 두게 됩니다.
+
+---
+
+**로테이션 + 유예 30초**
+
+| 고름 | 버림 |
+|---|---|
+| 쓸 때마다 교체, 30초 안 재사용은 경합으로 봄 | (A) 재사용을 그냥 401 — 탐지 이득이 사라짐 |
+| 30초 밖 재사용은 복제로 보아 전부 폐기 | (B) 유예 없이 전부 폐기 — 탭 두 개 = 전체 로그아웃 |
+
+30초는 Okta 기본값이고 Cognito 는 최대 60초입니다. 10초는 *"응답 유실 후 재시도"* 를 못 덮습니다.
+
+---
+
+**Lua 스크립트를 쓴 이유**
+
+처음에는 `claim` 과 `saveGrace` 를 따로 불렀는데 **병렬 검증에서 두 번 깨졌습니다.**
+그 사이가 5~10ms 였고, 줄여서 0.2ms 로 만들어도 또 깨졌습니다. 키 셋을 한 덩어리로
+바꾸는 방법은 Lua 뿐입니다.
+
+> 교훈 — *"창이 얼마나 좁은가"* 를 말할 때는 그 사이에 무엇이 들어 있는지 코드로 세어 봐야 합니다.
+
+---
+
+**`tokens_valid_from` — 지우지 않고 폐기**
+
+| 고름 | 버림 |
+|---|---|
+| 계정에 시각 하나. 그 앞의 토큰은 갱신에서 거부 | 계정별 jti 목록(Set) — 발급·삭제·만료를 두 곳에서 관리, TTL 로 사라진 jti 가 Set 에 남음 |
+| 지울 것이 없고 "모든 기기에서 로그아웃" 이 한 줄 | 키를 `refresh:{accountId}:{jti}` 로 바꾸고 `SCAN` — 전체 키를 훑음 |
+
+**값은 초 단위로 자릅니다.** JWT 의 `iat` 가 초 단위라 안 자르면 비밀번호를 바꾸고
+바로 로그인해 받은 토큰이 30분 뒤 거부됩니다.
+
+<br><br>
+
+---
+
+### 8-3. 계정
+
+**`SUSPENDED` 가 없는 이유**
+
+계정을 막아야만 풀리는 문제가 하나도 없습니다. 악성 후기는 후기를 지우고 잘못된 제보는
+반려합니다. 값만 열어 두면 정지·해제 API · 컬럼 셋 · 에러 코드 · 문서가 함께 필요한데
+**넣을 방법이 없는 값은 죽은 값**입니다.
+
+---
+
+**탈퇴해도 행을 안 지우는 이유**
+
+| 지우면 |
+|---|
+| 이벤트 소비가 실패했을 때 *"이 accountId 가 정말 탈퇴했나"* 를 확인할 근거가 없음 |
+| `refresh_token_log` 가 누구 것인지 모르는 고아가 됨 |
+| "전진 복구" 의 전제 — 마저 지우려면 "지워야 할 대상" 이 남아 있어야 함 |
+
+**식별자는 끊습니다.** 안 끊으면 같은 이메일로 영영 재가입이 안 됩니다.
+
+---
+
+**`nickname` 을 안 담는 이유**
+
+`user_profile` 의 컬럼이라 auth 가 user 를 불러야 합니다. `hasPet` · `defaultPetId` 를 뺀 근거가
+정확히 그것이었는데 `nickname` 만 남아 있으면 기준이 반쪽입니다.
+**결과로 auth 는 다른 서비스를 한 번도 안 부르는 서비스가 됐습니다.**
+
+---
+
+**닉네임 중복을 허용하는 이유**
+
+금지하면 가입 때 검사해야 해서 **auth 가 user 를 동기 호출하게 되고 이벤트 방식이 무너집니다.**
+닉네임이 나오는 자리가 후기 작성자 표시 하나뿐이라 사칭 유인도 없습니다.
+
+---
+
+**`WITHDRAWN` 판단을 리포지터리가 아니라 서비스에서 하는 이유**
+
+상황마다 처리가 다릅니다.
+
+| 상황 | 처리 |
+|---|---|
+| 로그인 | "탈퇴한 계정입니다" |
+| 가입 중복 검사 | 막아야 함 (이제는 이메일이 치환돼 안 걸림) |
+| 비밀번호 재설정 | 조용히 200 |
+
+리포지터리가 `findActiveByEmail` 로 걸러 버리면 *"없음"* 과 *"탈퇴함"* 이 구분되지 않습니다.
+
+---
+
+**팩터리 둘 (`createLocal` · `createSocial`)**
+
+로컬과 소셜이 채우는 필드가 다릅니다. 팩터리로 나누면 *"소셜인데 `password_hash` 가 있는"*
+조합을 애초에 만들 수 없고, **팩터리 안에서 검증하므로 잘못 부르면 `IllegalArgumentException`** 이
+납니다. 이것은 프로그래밍 실수라 `CustomException`(400) 이 아니라 500 이 맞습니다.
+
+<br><br>
+
+---
+
+### 8-4. 소셜 로그인
+
+**구글만인 이유**
+
+| 제공자 | 문제 |
+|---|---|
+| 카카오 | 이메일을 받으려면 비즈 앱 전환 + 개인정보 심사. **승인 일정을 통제할 수 없음** |
+| 네이버 | 검수 전에는 등록된 아이디만 로그인 |
+| 구글 | `email` 스코프가 기본. 사용자가 거부할 개념이 없어 **이메일이 항상 확보됨** |
+
+SES 대신 Gmail SMTP 를 고른 것과 같은 이유입니다 — 승인 일정을 우리가 통제할 수 없는 것은 씁니다.
+
+---
+
+**`spring-boot-starter-oauth2-client` 를 안 쓴 이유**
+
+그 라이브러리의 값어치는 `oauth2Login` 필터가 콜백을 받아 세션을 만드는 것인데, **우리는 우리 JWT 를
+쿠키에 심고 프론트로 302 해야 해서 마지막 단계를 바꿔야 합니다.** 그러면 내부 구조를 알아야 하고
+코드가 줄지도 않습니다. `MailSender` ↔ `SmtpMailSender` 와 같은 모양으로 `RestClient` 직접 호출이 낫습니다.
+
+---
+
+**같은 이메일의 LOCAL 계정에 자동 연결하는 이유**
+
+자동 연결이 위험한 경우는 *"기존 계정을 만든 사람이 그 이메일의 진짜 주인이 아닐 때"* 인데,
+**LOCAL 가입도 이메일 인증을 거치므로 양쪽 다 주인이 확인된 상태**입니다.
+거부하면 그 사용자는 앞으로도 계속 구글 로그인을 못 씁니다.
+
+---
+
+**`client-id` 를 config 에 그대로 두는 이유**
+
+authorize URL 에 실려 **브라우저 주소창에 뜨는 값**이고, 남이 알아도 등록된 redirect URI 로만
+돌아가 악용이 안 됩니다. 공개키를 config 에 둔 판단과 같습니다.
+
+---
+
+**구글 고정값(토큰 URL · JWKS URL)을 코드 상수로 둔 이유**
+
+`redirect-uri` 는 우리가 정해 콘솔에 등록하는 값이고 `token-uri` 는 구글이 정한 값입니다.
+한 블록에 섞으면 *"이 중에 내가 고쳐도 되는 게 뭐지"* 를 매번 판단하게 됩니다.
+
+<br><br>
+
+---
+
+### 8-5. 메일
+
+**Gmail 앱 비밀번호 · 개인 계정인 이유**
+
+SES 는 샌드박스에서 검증 주소로만 발송되고 프로덕션 승인 일정을 통제할 수 없습니다.
+Gmail 개인 계정은 하루 500통이라 심사에는 넉넉합니다.
+
+---
+
+**HTML 메일을 텍스트 블록으로 만드는 이유**
+
+넣을 것이 코드 6자리 하나라 20줄이면 끝납니다. 템플릿 엔진을 넣으면 의존성만 늡니다.
+**메일 HTML 은 웹과 규칙이 달라** `<style>` 을 무시하는 클라이언트가 있어 인라인 CSS 만 씁니다.
+
+---
+
+**발송 제한이 쿨다운 60초 + 시간당 5통인 이유**
+
+하나만으로는 부족합니다. 쿨다운만 있으면 주소를 바꿔 가며 부르는 것을 못 막고,
+상한만 있으면 그 한도까지 순식간에 몰아 보냅니다. **하루 500통은 생각보다 적어** 실제 위험입니다.
+
+**용도별로 따로 셉니다** (`signup` · `pwreset` · `withdraw`). 한 키로 세면 가입 인증을
+5번 받은 사람이 한 시간 동안 탈퇴를 못 합니다.
+
+---
+
+**Redis 부수효과를 커밋 뒤로 미루는 이유**
+
+Redis 는 롤백 대상이 아닙니다. 트랜잭션 안에서 `emailverified` 를 지우고 DB 저장이 실패하면
+**계정은 안 생겼는데 인증 표시만 사라져** 다시 인증해야 합니다.
+`AfterCommitExecutor` 가 그 자리이며 공통 모듈의 `OutboxCommitListener` 와 같은 방식입니다.
+
+<br><br>
+
+---
+
+### 8-6. 여러 번 깨진 자리 — 경합
+
+**이 서비스에서 실제로 깨진 경합이 넷입니다.** 전부 *"확인과 실행 사이의 틈"* 이었습니다.
+
+| 어디 | 무엇이 | 고친 방법 |
+|---|---|---|
+| 발송 제한 | `canSend` 와 `recordSent` 사이에 SMTP. 병렬 10발이 전부 통과 | `setIfAbsent` 로 쿨다운 키 선점 |
+| 갱신 | `claim` 과 `saveGrace` 사이. 병렬 2발이 `200/401` | Lua 로 키 셋 원자화 |
+| 탈퇴 코드 | `findCode` 와 `deleteCode` 사이. 같은 코드가 두 번 통과 | Lua 로 조건부 삭제 |
+| outbox 발행 | 리스너와 Relay 가 같은 행을 집음. 같은 이벤트가 카프카에 2건 | `FOR UPDATE SKIP LOCKED` (공통 모듈 0.0.8) |
+
+> **순차 호출로는 절대 안 드러납니다.** `ForEach-Object -Parallel` 로 때려야만 보입니다.
+> 같은 부류를 또 만나면 **검증 방법부터 정하고** 시작합니다.
+
+<br><br>
+
+---
+
+## 9. 막히기 쉬운 자리
+
+**실제로 겪은 것만** 적었습니다.
+
+<br><br>
+
+---
+
+### 9-1. 요청이 401 · 403 · 503 일 때
+
+| 증상 | 원인 | 확인 |
+|---|---|---|
+| `GET /me` 가 401 | **8081 로 직접 불렀음.** 헤더는 게이트웨이만 넣어 줌 | 8080 으로 |
+| 로그인이 401 | 게이트웨이나 auth 의 `permit-all` 에 그 경로가 빠짐 | 게이트웨이 로그에 `토큰 쿠키가 없습니다` 면 게이트웨이, auth 로그에 `인증 실패` 면 auth |
+| 관리자 API 가 403 | `UPDATE role='ADMIN'` 만 하고 재로그인 안 함 | 토큰의 `role` 은 발급 시점 값 |
+| 관리자 API 가 401 | 8081 직결 | `traceId` 가 있으면 auth 가 낸 것 |
+| 8080 이 503 | 게이트웨이가 유레카에서 auth 를 못 찾음 | 30초 기다림. `http://localhost:8761` 에 `AUTH-SERVICE` 가 있는지 |
+| 전 요청이 401 | **개인키와 공개키가 짝이 아님** | 키를 새로 만들었으면 config 의 공개키도 바꿨는지 |
+
+<br><br>
+
+---
+
+### 9-2. 기동이 안 될 때
+
+| 로그 | 원인 |
+|---|---|
+| `UnknownHostException: ${DB_HOST}` | 환경변수 `DB_HOST` 없음 |
+| `password authentication failed for user "auth_svc"` | `SERVICE_DB_PASSWORD` 가 `infra/.env` 와 다름. **계정이 없으면 `role does not exist`** 라 이것은 비밀번호 문제 |
+| `JwtProperties` 에서 `IllegalArgumentException` | `AUTH_JWT_PRIVATE_KEY_B64` 없음, 또는 config 의 `app.jwt.*` 가 안 내려옴 |
+| `AuthProperties` 에서 `IllegalStateException: permit-all` | config 를 못 받음. **설정 서버가 떠 있는지** |
+| `NoSuchBeanDefinitionException: JavaMailSender` | config 에 `spring.mail.host` 가 없음 — 그 값의 존재로 자동 설정이 켜짐 |
+| `Migration checksum mismatch` | 이미 실행된 V2x 파일을 고쳤음. 로컬 DB 를 지우고 다시 |
+| `Schema-validation: missing column` | 엔티티에 필드를 추가하고 마이그레이션을 안 만듦 |
+| 포트가 8080 으로 뜸 | config 의 `auth-service.yml` 을 못 찾음. 파일명이 `spring.application.name` 과 같은지 |
+
+<br><br>
+
+---
+
+### 9-3. 메일이 안 올 때
+
+| 증상 | 원인 |
+|---|---|
+| 200 인데 메일이 안 옴 | **스팸함.** 개인 Gmail 발신이라 거기로 갈 수 있음 |
+| 200 인데 메일이 안 옴 (스팸함에도) | 주소 오타. SMTP 는 받아들인 시점에 성공으로 보고 **반송은 나중에 발신 계정으로 옴** |
+| `535 Authentication failed` | 앱 비밀번호를 **띄어쓰기 포함해서** 넣었음. 16자리 붙여서 |
+| `535` (붙여도) | 앱 비밀번호가 아니라 계정 비밀번호를 넣음. **2단계 인증을 켜야 앱 비밀번호 메뉴가 나옴** |
+| 429 `MAIL_SEND_COOLDOWN` | 60초 안 재요청. 테스트 중 자주 걸림 — Redis 에서 `mailcooldown:*` 를 지우면 됨 |
+| 재설정은 200 인데 메일이 안 옴 | **의도된 동작일 수 있음.** 계정이 없거나 소셜 계정이면 조용히 200 |
+
+```bash
+# 발송 제한 풀기 (테스트용)
+docker compose exec redis redis-cli --scan --pattern 'mail*' | xargs docker compose exec -T redis redis-cli DEL
+```
+
+<br><br>
+
+---
+
+### 9-4. 구글 로그인이 안 될 때
+
+| 증상 | 원인 |
+|---|---|
+| 구글 화면에서 `redirect_uri_mismatch` | 콘솔에 등록한 URI 와 config 의 `redirect-uri` 가 한 글자라도 다름 |
+| 구글 화면에서 `access_denied` (테스트 사용자) | 앱이 Testing 상태인데 그 구글 계정이 등록 안 됨 |
+| 콜백이 `/login/error?reason=FAILED` | auth 로그를 봄. `invalid_client` 면 시크릿, `상태 쿠키가 없거나` 면 아래 |
+| 콜백 URL 을 복사해 다시 열면 FAILED | **정상.** `state` 가 1회용이고 `nonce` 가 재사용을 막음 |
+| 시크릿 창에서 콜백 URL 을 열면 FAILED | **정상.** `oauth_state` 쿠키가 없어 거부됨 |
+| 정상 로그인인데 FAILED, 로그에 `상태 쿠키가 없거나 값이 다릅니다` | `oauth_state` 쿠키가 `Strict` 로 만들어짐. **`Lax` 여야 함** — 콜백은 구글에서 오는 요청 |
+| `isNew` 가 예상과 다름 | **다른 브라우저는 다른 구글 계정**일 수 있음. 크롬과 엣지가 각자 로그인돼 있음 |
+| 쿠키 목록에 `refresh_token` 이 안 보임 | 5173 페이지에서 보고 있음. `Path=/api/v1/auth` 라 **8080 페이지를 한 번 열어야** 목록에 뜸 |
+
+<br><br>
+
+---
+
+### 9-5. 테스트 데이터를 만질 때
+
+| 하려는 것 | 주의 |
+|---|---|
+| Redis 를 비움 (`FLUSHDB`) | `emailverified:` 도 사라짐. **인증 뒤에 비우면 가입이 막힘** |
+| 계정을 지움 | `refresh_token_log` → `outbox` → `account` 순서. FK 는 없지만 정리하는 습관 |
+| 소셜 계정을 흉내 냄 | `auth_provider` 와 `provider_user_id` 만 바꿈. **`password_hash` 를 NULL 로 지우면 로그인이 안 되어 토큰을 못 받음** |
+| 탈퇴 계정을 흉내 냄 | `status` 만 `WITHDRAWN` 으로. `email` 이나 `provider_user_id` 를 지우면 조회에 안 걸려 신규 가입으로 빠짐 |
+| `retry_count` 를 올림 | **auth 를 내리고.** 발행 중 행에 잠금이 걸려 있음 |
+| 병렬 검증 | 순차로는 안 드러남. `1..10 \| ForEach-Object -Parallel { ... } -ThrottleLimit 10` |
+
+```sql
+-- 소셜 계정 흉내 (되돌리기 쉽게 password_hash 는 그대로)
+UPDATE account SET auth_provider='GOOGLE', provider_user_id='test-sub-123' WHERE email='...';
+UPDATE account SET auth_provider='LOCAL',  provider_user_id=NULL           WHERE email='...';
+```
+
+<br><br>
+
+---
+
+### 9-6. 코드를 고칠 때
+
+| 하려는 것 | 주의 |
+|---|---|
+| `Properties` 에 검증 추가 | **테스트 yml 에도 값을 넣어야** `contextLoads` 가 통과 |
+| 새 `@ConfigurationProperties` 클래스 | **`JwtEncoderConfig` 의 `@EnableConfigurationProperties` 목록**에 넣어야 빈이 됨. 이름이 JWT 인데 전부 거기 있음 |
+| 쿠키를 하나 더 만듦 | *"바깥에서 우리 주소로 오는 요청에 실려 와야 하나"* 를 물음. 그러면 `Strict` 로는 안 됨 |
+| 서비스 안에서 `@Transactional` 메서드를 부름 | **프록시를 안 거쳐 전파 설정이 무시됨.** 별도 빈으로 |
+| `revokeAllActive` 같은 벌크 UPDATE | `clearAutomatically = true` 를 쓰면 **직전에 고친 `Account` 변경이 사라짐** |
+| Redis 를 트랜잭션 안에서 씀 | 롤백이 안 됨. `AfterCommitExecutor` 로 |
+| 에러 코드를 새로 만듦 | *"프론트가 할 일이 다른가"* 가 기준. 상태 코드가 같다고 합치지 않고 다르다고 나누지도 않음 |
+| 이메일 관련 응답을 만듦 | **재설정 계열은 응답이 갈리는 자리를 하나도 만들지 않음.** 가입 계열은 반대로 알려 줌 |
+
+<br><br>
+
+---
+
+## 10. 아직 안 한 것
+
+**시점이 정해진 것과 판단만 남은 것**으로 나뉩니다.
+
+<br><br>
+
+---
+
+### 10-1. 시점이 정해진 것
+
+| 언제 | 무엇 |
+|---|---|
+| **nginx 를 붙일 때** | `ip_address` 채우기 — 게이트웨이가 `X-Forwarded-For` 를 넣게 하고 **몇 번째 값을 읽을지** 정함. 발송 제한의 IP 기준도 함께 |
+| | 구글 배포용 리디렉션 URI — **도메인 + HTTPS 가 있어야 등록 자체가 됨** |
+| **AWS 배포 때** | RS256 키 새 쌍 + 공개키 `gateway-server-prod.yml` |
+| | 구글 앱 게시 (Testing → Production) |
+| | springdoc 끄기 |
+| **S3 가 생기면** | 메일 상단에 로고 `<img>` 한 줄 |
+| **user · pet 이 생기면** | Swagger 를 게이트웨이 뒤에 통합할지 판단 |
+| **verdict · search 착수 시** | `RestClientAuthInterceptor` 배선 — auth 는 남을 안 불러 여기서 못 정함 |
+
+---
+
+**`ip_address` 가 NULL 인 이유**
+
+게이트웨이가 `X-Forwarded-For` 를 넣지 않는 것이 실물로 확인됐고, `remoteAddr` 은 게이트웨이 IP(`127.0.0.1`)라
+넣어도 쓸모가 없습니다. 진짜 IP 는 nginx 가 있어야 나오고 그때 *"신뢰하는 프록시가 몇 단인지"* 를 함께 정합니다.
+
+> `server.forward-headers-strategy=framework` 를 켜면 `ForwardedHeaderTransformer` 와 충돌해
+> `X-Forwarded-For` 만 안 실리는 사례(spring-cloud-gateway #2648)가 있습니다. 그때 기억할 것.
+
+<br><br>
+
+---
+
+### 10-2. 판단만 남은 것 — 급하지 않음
+
+| 무엇 | 상태 |
+|---|---|
+| `JwtEncoderConfig` 의 프로퍼티 등록을 `PropertiesConfig` 로 옮길지 | 지금 넷이라 급하지 않음. 늘면 어색해짐 |
+| 발송 제한을 `INCR` 방식으로 바꿀지 | 더 나은 구현이고 Lua 도 필요 없음. 틀려서가 아니라 급하지 않아서 안 함 |
+| `max.block.ms` 를 낮출지 | 카프카가 죽었을 때 3초가 아니라 60초를 붙잡음. 공통 모듈 문제 |
+| 탈퇴 계정을 일정 기간 뒤 실제로 지우는 배치 | 지금 규모에서 불필요 |
+| `state` 값에 `returnTo` 를 담을지 | "장소 상세에서 바로 로그인" 흐름이 생기면. **그때 열린 리다이렉트 검사를 함께** |
+
+---
+
+**의도적으로 안 한 것 — 다시 꺼내지 않음**
+
+| 무엇 | 왜 |
+|---|---|
+| 탈퇴 직후 액세스 토큰 즉시 폐기 | 게이트웨이가 매 요청마다 폐기 목록을 조회해야 함 = 무상태 결정을 뒤집는 일. 30분 동안 조회만 가능 |
+| `email_verified` 만으로 자동 연결하지 말라 | 회사 이메일 재할당 시나리오. 심사용 서비스에서 성립하지 않고 검증할 방법도 없음 |
+| Redis 클러스터 해시 태그 | Redis 는 단일 인스턴스. 쓰지도 않을 구성을 위해 인터페이스를 넓히지 않음 |
+| `@Version` 낙관적 잠금 | 탭 두 개 동시 갱신이 `OptimisticLockException` 으로 깨짐 — Lua 로 만든 "둘 다 200" 이 무너짐 |
+| 통합 테스트 | auth 에 테스트가 `contextLoads` 하나뿐. 없는 체계를 이슈 안에서 세울 수 없음 |
+
+<br><br>
+
+---
+
+### 10-3. 프론트에 전달할 것
+
+| 무엇 | 왜 |
+|---|---|
+| 401 시 자동 `/refresh` 후 재시도하는 인터셉터 + 동시 401 큐잉 | 30분마다 로그인하지 않게 |
+| 로그인 여부는 `GET /auth/me` 로만 | 쿠키가 HttpOnly |
+| `nickname` 은 `GET /users/me` 로 | auth 응답에 없음 |
+| 메일이 안 오면 스팸함 안내 | 개인 Gmail 발신 |
+| 소셜 가입 직후 프로필 설정으로 유도 | `nickname` 이 null |
+| `/login/success?isNew=` · `/login/error?reason=` 두 라우트 | 콜백이 302 로 보냄 |
+| 탈퇴 확인 화면에 "삭제된 데이터는 복구할 수 없습니다" | 재가입은 새 계정 |
+| 관리자 페이지 — outbox 5개 서비스를 각각 불러 한 화면에 | Swagger 로는 못 부름 |
+
+<br><br>
+
+---
+
+## 11. 용어
+
+공통 용어(트랜잭션 · 엔티티 · 컨테이너 등)는 `service-template` README 11장에 있습니다.
+**여기는 인증에서만 쓰는 말**입니다.
+
+| 용어 | 뜻 |
+|---|---|
+| **JWT** | 사용자 정보를 담고 서명한 문자열. `헤더.페이로드.서명`. 페이로드는 누구나 읽지만 고치면 서명이 안 맞음 |
+| **claim** | JWT 페이로드 안의 항목 하나. `sub` · `role` · `exp` 등 |
+| **`sub`** | subject. 토큰이 가리키는 사람. 우리는 계정 UUID |
+| **`jti`** | JWT ID. 토큰 고유 번호. 리프레시 토큰의 Redis 키 |
+| **`iat`** · **`exp`** | 발급 시각 · 만료 시각 (초 단위) |
+| **`typ`** | 우리가 넣은 claim. `access` 또는 `refresh` |
+| **액세스 토큰** | 30분짜리. 모든 요청에 실려 감. 게이트웨이가 검증 |
+| **리프레시 토큰** | 14일짜리. 갱신·로그아웃에만 실려 감. Redis 에 저장 |
+| **로테이션** | 리프레시 토큰을 쓸 때마다 새것으로 바꾸는 것 |
+| **유예 (grace)** | 로테이션 직후 30초 동안 옛 토큰을 경합으로 봐 주는 창 |
+| **복제 탐지** | 유예가 지난 옛 토큰이 또 오면 훔친 것으로 보고 전부 폐기 |
+| **`tokens_valid_from`** | 이 시각 이전 토큰은 전부 무효. 지우지 않고 폐기하는 장치 |
+| **RS256** | RSA 비대칭 서명. 개인키로 만들고 공개키로 확인 |
+| **개인키 · 공개키** | 한 쌍. 개인키는 auth 만, 공개키는 게이트웨이 |
+| **BCrypt** | 비밀번호 해시. 같은 입력도 매번 다른 결과이고 72바이트 상한 |
+| **HttpOnly** | 자바스크립트가 못 읽는 쿠키 |
+| **SameSite** | 다른 사이트에서 시작된 요청에 쿠키를 실을지. `Strict` 는 안 실음, `Lax` 는 최상위 GET 이동만 |
+| **XSS** | 스크립트 주입. `localStorage` 의 토큰을 훔쳐 감 |
+| **CSRF** | 다른 사이트에서 요청 위조. 쿠키가 자동으로 실리는 것을 이용. `SameSite` 로 막음 |
+| **OAuth** | 구글 같은 제공자에게 로그인을 맡기는 규격 |
+| **`code`** | 구글이 콜백에 붙여 주는 1회용 값. 이것으로 토큰을 교환 |
+| **`id_token`** | 구글이 주는 JWT. 사용자 정보(`sub` · `email`)가 들어 있음 |
+| **`sub` (구글)** | 구글 계정 고유 ID. `provider_user_id` 에 저장 |
+| **`state`** | 우리가 시작한 로그인인지 확인하는 랜덤값 |
+| **`nonce`** | `id_token` 재사용을 막는 랜덤값 |
+| **JWKS** | 구글의 공개키 목록 주소. `id_token` 서명 검증에 씀 |
+| **redirect URI** | 구글이 로그인 뒤 브라우저를 보낼 우리 주소. 콘솔에 등록한 것과 같아야 함 |
+| **SMTP** | 메일 보내는 규약. Gmail 은 587 포트 + STARTTLS |
+| **앱 비밀번호** | Gmail 이 SMTP 용으로 따로 발급하는 16자리. 계정 비밀번호로는 접속 불가 |
+| **outbox** | 이벤트를 DB 에 먼저 저장하고 커밋 뒤 발행. `service-template` README 7-4 |
+| **Lua 스크립트** | Redis 안에서 여러 명령을 한 덩어리로 실행. 그 사이에 다른 명령이 안 끼어듦 |
+| **`SETNX` / `setIfAbsent`** | 키가 없을 때만 저장. 동시 요청 중 하나만 성공 |
+| **`GETDEL`** | 읽고 바로 지움. 원자적 |
+| **멱등** | 여러 번 해도 결과가 한 번과 같음. 로그아웃이 그래야 함 |
+| **경합 (race)** | 두 요청이 같은 자리에 동시에 들어와 "확인과 실행 사이" 가 벌어지는 것 |

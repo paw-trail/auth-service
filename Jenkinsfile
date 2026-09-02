@@ -8,7 +8,7 @@
 @Library('pawtrail-pipeline') _
 
 springServicePipeline(
-    serviceName: 'template',
+    serviceName: 'auth-service',
     deployNode : 'app',
     instances  : 1
 )

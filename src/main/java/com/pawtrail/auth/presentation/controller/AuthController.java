@@ -1,0 +1,336 @@
+package com.pawtrail.auth.presentation.controller;
+
+import com.pawtrail.auth.application.dto.output.AccountOutput;
+import com.pawtrail.auth.presentation.support.ClientInfoFactory;
+import com.pawtrail.auth.application.service.AccountService;
+import com.pawtrail.auth.application.service.AuthService;
+import com.pawtrail.auth.application.service.EmailVerificationService;
+import com.pawtrail.auth.application.service.LogoutService;
+import com.pawtrail.auth.application.service.PasswordResetService;
+import com.pawtrail.auth.application.service.RefreshService;
+import com.pawtrail.auth.application.service.WithdrawService;
+import com.pawtrail.auth.infrastructure.security.CookieFactory;
+import com.pawtrail.auth.presentation.request.EmailVerificationRequest;
+import com.pawtrail.auth.presentation.request.LoginRequest;
+import com.pawtrail.auth.presentation.request.PasswordChangeRequest;
+import com.pawtrail.auth.presentation.request.SignupRequest;
+import com.pawtrail.common.response.CommonApiResponse;
+import com.pawtrail.common.security.annotation.CurrentUser;
+import com.pawtrail.common.security.principal.CustomUserPrincipal;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseCookie;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CookieValue;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * 인증 API 입니다.
+ *
+ * 대부분의 경로는 게이트웨이가 인증 헤더를 넣지 않고 통과시킵니다.
+ * 토큰을 받기 전에 불러야 하는 요청이기 때문이며,
+ * 같은 목록이 config 저장소의 app.gateway.permit-all 과 app.auth.permit-all 양쪽에 있습니다.
+ *
+ * /me 로 시작하는 것들만 예외입니다.
+ * 이미 로그인한 사람이 자기 계정을 다루는 요청이라 인증이 필요하고,
+ * 그 값은 다른 서비스와 똑같이 게이트웨이가 넣어 준 헤더에서 옵니다.
+ * 이 서비스가 토큰을 발급하는 쪽이라고 해서 자기 요청의 토큰을 직접 파싱하지 않습니다.
+ */
+@Slf4j
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final AuthService authService;
+    private final AccountService accountService;
+    private final RefreshService refreshService;
+    private final LogoutService logoutService;
+    private final EmailVerificationService emailVerificationService;
+    private final PasswordResetService passwordResetService;
+    private final WithdrawService withdrawService;
+    private final CookieFactory cookieFactory;
+
+    /**
+     * 회원가입입니다.
+     *
+     * 가입한 뒤 자동으로 로그인시키지 않습니다.
+     * 쿠키를 심으려면 토큰을 발급해야 하는데, 방금 비밀번호를 정한 사람이
+     * 그것으로 한 번 들어와 보는 편이 낫다고 보았습니다.
+     */
+    @PostMapping("/signup")
+    public ResponseEntity<CommonApiResponse<AccountOutput>> signup(
+            @Valid @RequestBody SignupRequest request) {
+
+        AccountOutput response = authService.signup(request.toInput());
+
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(CommonApiResponse.success(response));
+    }
+
+    /**
+     * 로그인입니다.
+     *
+     * 토큰은 응답 바디가 아니라 쿠키로 나갑니다.
+     * 브라우저 스크립트가 값을 읽지 못하게 하기 위함이며,
+     * 그래서 프론트는 로그인 여부를 GET /auth/me 로만 알 수 있습니다.
+     */
+    @PostMapping("/login")
+    public ResponseEntity<CommonApiResponse<AccountOutput>> login(
+            @Valid @RequestBody LoginRequest request,
+            HttpServletRequest servletRequest) {
+
+        // 어떤 주소에서 왔는지를 확인하기 위한 로그임
+        //
+        // 앞에 게이트웨이가 있어 getRemoteAddr 은 게이트웨이 주소를 돌려줍니다.
+        // 원래 주소는 X-Forwarded-For 헤더에 실려 오는데, 그것이 실제로 도착하는지를
+        // 아직 확인하지 못했음. 받는 쪽이 있어야 보이는 값이기 때문임
+        //
+        // 확인이 끝나면 이 로그를 지우고 refresh_token_log 의 ip_address 를 채우는 방식을 정함
+        log.info("로그인 요청 X-Forwarded-For={}, User-Agent={}, remoteAddr={}",
+                servletRequest.getHeader("X-Forwarded-For"),
+                servletRequest.getHeader(HttpHeaders.USER_AGENT),
+                servletRequest.getRemoteAddr());
+
+        AuthService.LoginResult result = authService.login(
+                request.toInput(ClientInfoFactory.from(servletRequest)));
+
+        ResponseCookie accessCookie = cookieFactory.accessToken(
+                result.accessToken().value(), result.accessToken().expiresAt());
+        ResponseCookie refreshCookie = cookieFactory.refreshToken(
+                result.refreshToken().value(), result.refreshToken().expiresAt());
+
+        // 쿠키 두 개를 각각 헤더로 붙임
+        //
+        // Set-Cookie 는 하나의 헤더에 여러 값을 담을 수 없어 줄이 두 개가 됩니다.
+        // add 를 두 번 부르는 것이 그 때문이며 set 을 쓰면 뒤엣것이 앞을 덮음
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
+                .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
+                .body(CommonApiResponse.success(result.account()));
+    }
+
+    /**
+     * 액세스 토큰을 다시 발급합니다.
+     *
+     * 이 경로는 인증 없이 열려 있습니다.
+     * 액세스 토큰이 만료된 상태로 부르는 요청이라 인증을 걸면 아무도 갱신할 수 없습니다.
+     *
+     * 리프레시 토큰도 함께 새로 발급되어 쿠키 두 개가 모두 갱신됩니다.
+     * 응답 바디는 비어 있습니다.
+     * 프론트가 이것을 부르는 자리는 401 인터셉터 안이고 거기서 필요한 것은 새 쿠키뿐이며,
+     * 로그인 여부는 GET /auth/me 로만 판단한다는 규칙을 흐리지 않기 위해서입니다.
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<CommonApiResponse<Void>> refresh(
+            @CookieValue(name = CookieFactory.REFRESH_TOKEN, required = false)
+            String refreshTokenValue,
+            HttpServletRequest servletRequest) {
+
+        RefreshService.RefreshResult result = refreshService.refresh(
+                refreshTokenValue, ClientInfoFactory.from(servletRequest));
+
+        ResponseCookie accessCookie = cookieFactory.accessToken(
+                result.accessToken(), result.accessExpiresAt());
+        ResponseCookie refreshCookie = cookieFactory.refreshToken(
+                result.refreshToken(), result.refreshExpiresAt());
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
+                .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 로그아웃입니다.
+     *
+     * 어떤 경우에도 성공으로 응답합니다.
+     * 쿠키가 없어도, 토큰이 만료됐어도, 읽을 수 없는 값이어도 마찬가지입니다.
+     * 여기서 401 을 내보내면 클라이언트가 지우지 못하는 쿠키를 들고 갇힙니다.
+     *
+     * 지우는 쿠키의 속성은 만들 때와 같아야 합니다.
+     * 경로가 다르면 브라우저가 다른 쿠키로 보아 원래 것이 그대로 남는데,
+     * 오류가 나지 않으므로 "로그아웃했는데 토큰이 살아 있는" 상태를 알아채기 어렵습니다.
+     * CookieFactory 가 만들 때와 같은 값으로 만료 쿠키를 찍어 주는 것이 그 때문입니다.
+     *
+     * 액세스 토큰은 되돌릴 수 없어 만료까지 그대로 쓸 수 있습니다.
+     * 쿠키를 지우면 브라우저에서는 사라지지만 이미 복사된 값까지 막지는 못하며,
+     * 수명을 30분으로 짧게 둔 것이 유일한 대응입니다.
+     */
+    @PostMapping("/logout")
+    public ResponseEntity<CommonApiResponse<Void>> logout(
+            @CookieValue(name = CookieFactory.REFRESH_TOKEN, required = false)
+            String refreshTokenValue) {
+
+        logoutService.logout(refreshTokenValue);
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireAccessToken().toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireRefreshToken().toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 내 계정 정보를 봅니다.
+     *
+     * 쿠키가 HttpOnly 라 프론트는 토큰 안을 읽을 수 없습니다.
+     * 그래서 로그인했는지, 누구로 로그인했는지를 확인하는 유일한 창구가 여기입니다.
+     *
+     * 로그인 응답과 같은 형태를 돌려줍니다.
+     * 프론트가 두 자리에서 같은 모양을 다루면 되고, 로그인 직후에 이것을 또 부를 필요도 없습니다.
+     */
+    @GetMapping("/me")
+    public ResponseEntity<CommonApiResponse<AccountOutput>> getMyAccount(
+            @CurrentUser CustomUserPrincipal principal) {
+
+        AccountOutput response = accountService.getMyAccount(principal.accountId());
+        return ResponseEntity.ok(CommonApiResponse.success(response));
+    }
+
+    /**
+     * 비밀번호를 바꿉니다.
+     *
+     * 비밀번호 재설정과 다른 기능입니다.
+     * 그쪽은 비밀번호를 잊은 사람이 메일로 본인을 증명하지만,
+     * 여기는 로그인한 사람이 현재 비밀번호로 증명합니다.
+     *
+     * 바꾸고 나면 쿠키를 지웁니다.
+     *
+     * 이전에 발급된 토큰이 전부 무효가 되는데 본인의 것도 거기 포함되기 때문입니다.
+     * 지우지 않으면 브라우저에 쓸 수 없는 쿠키가 남고, 사용자는 30분쯤 지나
+     * 갱신이 거부될 때가 되어서야 로그아웃된 것을 알게 됩니다.
+     * 지금 지우면 화면이 곧바로 로그인으로 넘어갑니다.
+     */
+    @PatchMapping("/me/password")
+    public ResponseEntity<CommonApiResponse<Void>> changePassword(
+            @CurrentUser CustomUserPrincipal principal,
+            @Valid @RequestBody PasswordChangeRequest request) {
+
+        accountService.changePassword(principal.accountId(), request.toInput());
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireAccessToken().toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireRefreshToken().toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 탈퇴 인증 코드를 보냅니다.
+     *
+     * 이 경로는 인증이 필요합니다. permit-all 목록에 넣지 않습니다.
+     * 가입 인증과 비밀번호 재설정은 토큰을 받기 전에 부르는 요청이라 열어 두었지만,
+     * 탈퇴는 이미 로그인한 사람이 자기 계정에 하는 일입니다.
+     *
+     * 이메일을 받지 않습니다. 게이트웨이가 넣어 준 식별자로 계정을 찾아
+     * 거기 등록된 주소로 보냅니다.
+     */
+    @PostMapping("/withdraw/verify-request")
+    public ResponseEntity<CommonApiResponse<Void>> sendWithdrawCode(
+            @CurrentUser CustomUserPrincipal principal) {
+
+        withdrawService.sendCode(principal.accountId());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 탈퇴합니다.
+     *
+     * 본인 확인을 메일 코드로 합니다.
+     * 비밀번호로 하면 소셜 계정은 확인할 수단이 없어 계정 종류에 따라
+     * 보호 수준이 갈리는데, 이메일은 어느 쪽이든 반드시 있습니다.
+     *
+     * 성공하면 쿠키를 지웁니다.
+     * 발급된 토큰이 전부 무효가 되므로 남겨 두면 브라우저에 쓸 수 없는 쿠키가 남고,
+     * 사용자는 다음 요청이 거부될 때가 되어서야 상태를 알게 됩니다.
+     *
+     * 계정 행은 남지만 이메일과 제공자 식별자가 끊기므로 같은 주소로 다시 가입할 수 있습니다.
+     * 다만 새 계정이며 옛 데이터는 돌아오지 않습니다.
+     */
+    @DeleteMapping("/me")
+    public ResponseEntity<CommonApiResponse<Void>> withdraw(
+            @CurrentUser CustomUserPrincipal principal,
+            @Valid @RequestBody EmailVerificationRequest.Withdraw request) {
+
+        withdrawService.withdraw(principal.accountId(), request.code());
+
+        return ResponseEntity
+                .ok()
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireAccessToken().toString())
+                .header(HttpHeaders.SET_COOKIE, cookieFactory.expireRefreshToken().toString())
+                .body(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 회원가입 인증 코드를 보냅니다.
+     *
+     * 이미 쓰는 이메일이면 그 사실을 알려 줍니다.
+     * 아래 비밀번호 재설정과 정반대인데, 가입은 알려 주지 않으면
+     * 사용자가 왜 진행이 안 되는지 알 수 없기 때문입니다.
+     */
+    @PostMapping("/email/verify-request")
+    public ResponseEntity<CommonApiResponse<Void>> sendSignupCode(
+            @Valid @RequestBody EmailVerificationRequest.SendCode request) {
+
+        emailVerificationService.sendCode(request.email());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 회원가입 인증 코드를 확인합니다.
+     *
+     * 통과하면 표시가 남고 회원가입이 그것을 확인합니다.
+     * 표시는 30분간 유효하므로 그 안에 가입을 마쳐야 합니다.
+     */
+    @PostMapping("/email/verify")
+    public ResponseEntity<CommonApiResponse<Void>> verifySignupCode(
+            @Valid @RequestBody EmailVerificationRequest.VerifyCode request) {
+
+        emailVerificationService.verify(request.toInput());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 비밀번호 재설정 코드를 보냅니다.
+     *
+     * 어떤 경우에도 성공으로 응답합니다.
+     * 가입되지 않은 이메일이어도, 소셜 계정이어도, 발송이 실패해도 마찬가지입니다.
+     * 응답이 갈리면 그 차이만으로 어떤 이메일이 가입되어 있는지 알아낼 수 있습니다.
+     */
+    @PostMapping("/password/reset-request")
+    public ResponseEntity<CommonApiResponse<Void>> sendResetCode(
+            @Valid @RequestBody EmailVerificationRequest.SendCode request) {
+
+        passwordResetService.sendCode(request.email());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+
+    /**
+     * 코드를 확인하고 비밀번호를 바꿉니다.
+     *
+     * 로그인 상태에서 바꾸는 것과 다른 기능입니다.
+     * 그쪽은 현재 비밀번호로 본인을 확인하지만 여기는 그것을 모르는 상태라
+     * 메일이 본인 확인 수단입니다.
+     */
+    @PostMapping("/password/reset")
+    public ResponseEntity<CommonApiResponse<Void>> resetPassword(
+            @Valid @RequestBody EmailVerificationRequest.ResetPassword request) {
+
+        passwordResetService.reset(request.toInput());
+        return ResponseEntity.ok(CommonApiResponse.success(null));
+    }
+}
