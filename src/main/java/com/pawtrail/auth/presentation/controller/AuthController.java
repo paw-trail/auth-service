@@ -64,19 +64,33 @@ public class AuthController {
     /**
      * 회원가입입니다.
      *
-     * 가입한 뒤 자동으로 로그인시키지 않습니다.
-     * 쿠키를 심으려면 토큰을 발급해야 하는데, 방금 비밀번호를 정한 사람이
-     * 그것으로 한 번 들어와 보는 편이 낫다고 보았습니다.
+     * 가입이 끝나면 곧바로 로그인시킵니다.
+     * 응답은 로그인과 같은 형태이며 토큰은 바디가 아니라 쿠키로 나갑니다.
+     * 상태 코드만 201 로 다릅니다. 계정이 새로 만들어졌기 때문입니다.
+     *
+     * 프론트는 이 응답을 받은 뒤 바로 반려동물 등록을 부를 수 있습니다.
+     * 다만 프로필은 account.created 이벤트를 user 가 받아 만들므로 몇 초 늦을 수 있어,
+     * GET /users/me 가 404 를 돌려주면 짧게 다시 시도하는 것이 프론트의 몫입니다.
      */
     @PostMapping("/signup")
     public ResponseEntity<CommonApiResponse<AccountOutput>> signup(
-            @Valid @RequestBody SignupRequest request) {
+            @Valid @RequestBody SignupRequest request,
+            HttpServletRequest servletRequest) {
 
-        AccountOutput response = authService.signup(request.toInput());
+        AuthService.LoginResult result = authService.signup(
+                request.toInput(ClientInfoFactory.from(servletRequest)));
 
+        ResponseCookie accessCookie = cookieFactory.accessToken(
+                result.accessToken().value(), result.accessToken().expiresAt());
+        ResponseCookie refreshCookie = cookieFactory.refreshToken(
+                result.refreshToken().value(), result.refreshToken().expiresAt());
+
+        // 쿠키 두 개를 각각 헤더로 붙임. 로그인과 같은 코드임
         return ResponseEntity
                 .status(HttpStatus.CREATED)
-                .body(CommonApiResponse.success(response));
+                .header(HttpHeaders.SET_COOKIE, accessCookie.toString())
+                .header(HttpHeaders.SET_COOKIE, refreshCookie.toString())
+                .body(CommonApiResponse.success(result.account()));
     }
 
     /**

@@ -1,5 +1,6 @@
 package com.pawtrail.auth.presentation.request;
 
+import com.pawtrail.auth.application.dto.input.ClientInfo;
 import com.pawtrail.auth.application.dto.input.SignupInput;
 import com.pawtrail.auth.presentation.request.validation.MaxBytes;
 import jakarta.validation.constraints.Email;
@@ -55,8 +56,10 @@ public record SignupRequest(
      * 서비스가 받는 형태로 바꿉니다.
      *
      * 검증은 여기까지가 끝이고 그 아래는 값만 흐릅니다.
+     * 접속 정보는 요청 바디가 아니라 헤더에서 오므로 컨트롤러가 만들어 넣어 줍니다.
+     * 로그인 요청과 같은 방식입니다.
      */
-    public SignupInput toInput() {
-        return new SignupInput(email, password, nickname);
+    public SignupInput toInput(ClientInfo client) {
+        return new SignupInput(email, password, nickname, client);
     }
 }
