@@ -344,6 +344,9 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/auth/signup `
 
 > PowerShell 은 **한글을 바이트로 바꿔 보냅니다.** 안 그러면 닉네임이 `???` 로 저장됩니다.
 > 메일이 안 오면 **스팸함**을 봅니다. 개인 Gmail 발신이라 거기로 갈 수 있습니다.
+>
+> ③ 의 응답에 **`Set-Cookie` 두 줄**이 붙으면 자동 로그인까지 된 것입니다.
+> `curl -i` 로 헤더를 함께 보거나, `-c cookies.txt` 로 받아 `GET /auth/me -b cookies.txt` 가 200 인지 봅니다.
 
 ---
 
@@ -629,7 +632,7 @@ auth  ──▶  토큰  ──▶  게이트웨이     서명 확인 → sub ·
 |---|---|---|---|---|
 | 1 | POST | `/api/v1/auth/email/verify-request` | 불필요 | 가입용 인증 코드 발송 |
 | 2 | POST | `/api/v1/auth/email/verify` | 불필요 | 코드 확인 |
-| 3 | POST | `/api/v1/auth/signup` | 불필요 | 회원가입 |
+| 3 | POST | `/api/v1/auth/signup` | 불필요 | 회원가입. **성공하면 쿠키 2개를 심어 자동 로그인** |
 | 4 | POST | `/api/v1/auth/login` | 불필요 | 로그인 |
 | 5 | POST | `/api/v1/auth/refresh` | 리프레시 쿠키 | 토큰 갱신 |
 | 6 | POST | `/api/v1/auth/logout` | 리프레시 쿠키 | 로그아웃 |
@@ -696,10 +699,13 @@ auth  ──▶  토큰  ──▶  게이트웨이     서명 확인 → sub ·
         ├──▶  이미 가입된 이메일인가           있으면 409 EMAIL_ALREADY_EXISTS
         ├──▶  account 행 INSERT              BCrypt 해시, status ACTIVE
         ├──▶  outbox 에 account.created      {accountId, email, nickname}
+        ├──▶  토큰 2개 발급 · refresh_token_log 1행     로그인과 같은 코드 (3-3)
         └──▶  커밋 뒤 emailverified 삭제      같은 인증으로 두 번 가입 방지
         │
         ▼
-④ 201 Created  {accountId, email, role, authProvider}
+④ 201 Created  {accountId, email, role, authProvider}  +  Set-Cookie 2개
+        │
+        ├──▶  브라우저는 이미 로그인 상태      바로 반려동물 등록으로 감
         │
         └──▶  카프카  account.created  ──▶  user 서비스가 프로필을 만듦
                                             (nickname 은 여기서 저장됨)
@@ -755,14 +761,32 @@ POST /api/v1/auth/signup
 |---|---|
 | `email` | 형식 검사 |
 | `password` | **8자 이상 72자 이하, 72바이트 이하.** 문자 조합은 강제하지 않습니다 |
-| `nickname` | 30자 이하. **auth 는 저장하지 않고 이벤트로 user 에 넘깁니다** |
+| `nickname` | 2자 이상 20자 이하. **auth 는 저장하지 않고 이벤트로 user 에 넘깁니다** |
 
-```json
+```http
 201 Created
+Set-Cookie: access_token=eyJ...;  Path=/;             Max-Age=1799;    HttpOnly; SameSite=Strict
+Set-Cookie: refresh_token=eyJ...; Path=/api/v1/auth;  Max-Age=1209599; HttpOnly; SameSite=Strict
+
 { "data": { "accountId": "01a0...", "email": "me@example.com", "role": "USER", "authProvider": "LOCAL" } }
 ```
 
-> **가입 후 자동 로그인은 없습니다.** 로그인 화면으로 보냅니다.
+**가입하면 곧바로 로그인됩니다.** 응답이 로그인과 같은 형태이고 상태 코드만 201 입니다.
+
+```
+가입 화면이 두 단계임        ① 계정 만들기  →  ② 반려동물 등록
+                                               ▲
+                                               └── POST /pets 는 인증이 필요함
+                                                   쿠키가 없으면 여기서 401
+```
+
+그래서 signup 끝에 로그인과 같은 토큰 발급이 붙어 있습니다. 소셜 로그인은 처음부터 콜백에서
+쿠키를 심고 있었으므로, **이제 가입 방식이 달라도 화면 순서가 같습니다.**
+
+> **프론트가 알아둘 것** — 프로필은 `account.created` 를 user 가 받아 만들므로 가입 직후
+> `GET /users/me` 가 잠깐 404 일 수 있습니다. 짧게 다시 시도하면 됩니다.
+> 자동 로그인 전에는 로그인 화면을 거치는 시간이 그 틈을 가려 주고 있었습니다.
+>
 > 비밀번호 상한이 72바이트인 것은 BCrypt 제약입니다. 한글은 한 글자가 3바이트라
 > `@MaxBytes(72)` 검증을 따로 둡니다.
 
@@ -2545,6 +2569,8 @@ UPDATE account SET auth_provider='LOCAL',  provider_user_id=NULL           WHERE
 | `nickname` 은 `GET /users/me` 로 | auth 응답에 없음 |
 | 메일이 안 오면 스팸함 안내 | 개인 Gmail 발신 |
 | 소셜 가입 직후 프로필 설정으로 유도 | `nickname` 이 null |
+| 가입 뒤 로그인 화면을 거치지 않음 — 바로 반려동물 등록으로 | 가입 응답이 쿠키를 심음 |
+| 가입 직후 `GET /users/me` 가 404 면 짧게 재시도 | 프로필은 이벤트로 늦게 생김 |
 | `/login/success?isNew=` · `/login/error?reason=` 두 라우트 | 콜백이 302 로 보냄 |
 | 탈퇴 확인 화면에 "삭제된 데이터는 복구할 수 없습니다" | 재가입은 새 계정 |
 | 관리자 페이지 — outbox 5개 서비스를 각각 불러 한 화면에 | Swagger 로는 못 부름 |
