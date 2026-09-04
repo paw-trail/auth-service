@@ -40,6 +40,15 @@ public class AuthService {
     /**
      * 회원가입입니다.
      *
+     * 가입이 끝나면 곧바로 로그인시킵니다.
+     * 프론트의 가입 흐름이 계정 만들기와 반려동물 등록의 두 단계인데,
+     * 반려동물 등록은 인증이 필요한 요청입니다. 여기서 토큰을 발급하지 않으면
+     * 그 요청이 401 로 막히고, 사용자는 방금 정한 비밀번호로 한 번 더 들어와야 합니다.
+     * 소셜 로그인은 처음부터 콜백에서 쿠키를 심고 있어 로컬 가입만 흐름이 길었습니다.
+     *
+     * 로그인 결과와 같은 것을 돌려주는 것은 그 뒤가 로그인과 완전히 같기 때문입니다.
+     * 컨트롤러가 쿠키를 심는 코드도 로그인과 같습니다.
+     *
      * 계정을 만드는 것과 이벤트를 기록하는 것이 한 트랜잭션 안에 있어야 합니다.
      * 나뉘면 "계정은 생겼는데 프로필이 안 생기는" 상태가 만들어지고,
      * 그때 되돌리거나 다시 시도하는 장치를 따로 짜야 합니다.
@@ -48,7 +57,7 @@ public class AuthService {
      * 이 애노테이션을 빠뜨리면 기동이 아니라 호출 시점에 바로 드러납니다.
      */
     @Transactional
-    public AccountOutput signup(SignupInput input) {
+    public LoginResult signup(SignupInput input) {
         String email = input.email();
 
         // 이메일 인증을 거쳤는지 확인함
@@ -91,12 +100,21 @@ public class AuthService {
         afterCommitExecutor.run(() -> emailVerificationStore.clearVerified(email),
                 "이메일 인증 표시 삭제");
 
+        // 가입 직후의 로그인 한 번을 엶
+        //
+        // 로그인과 같은 메서드라 토큰 발급, 이력 기록, 마지막 로그인 시각 갱신이 함께 일어남
+        // refresh_token_log 에 가입 시점 행이 하나 생기는데, login_id 로 가입 세션이 묶이므로
+        // "가입" 과 "첫 로그인" 이 구분되지 않던 이력이 오히려 정확해짐
+        TokenIssueService.IssuedSession session =
+                tokenIssueService.issue(account, input.client());
+
         log.info("회원가입 완료 accountId={}", account.getId());
-        return AccountOutput.from(account);
+        return new LoginResult(AccountOutput.from(account),
+                session.accessToken(), session.refreshToken());
     }
 
     /**
-     * 로그인 결과입니다.
+     * 로그인 결과입니다. 가입 직후의 자동 로그인도 이것을 돌려줍니다.
      *
      * 컨트롤러가 토큰을 쿠키로 바꿔 심어야 하므로 발급된 토큰을 함께 돌려줍니다.
      * 쿠키를 만드는 일을 이 계층에서 하지 않는 것은 그것이 HTTP 의 사정이기 때문입니다.
