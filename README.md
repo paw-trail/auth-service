@@ -2518,7 +2518,6 @@ UPDATE account SET auth_provider='LOCAL',  provider_user_id=NULL           WHERE
 | | springdoc 끄기 |
 | **S3 가 생기면** | 메일 상단에 로고 `<img>` 한 줄 |
 | **user · pet 이 생기면** | Swagger 를 게이트웨이 뒤에 통합할지 판단 |
-| **verdict · search 착수 시** | `RestClientAuthInterceptor` 배선 — auth 는 남을 안 불러 여기서 못 정함 |
 
 ---
 
